@@ -1,0 +1,9 @@
+# All paths are relative to CNN_FPGA/.
+data_dir: data
+batch_size: 128
+num_workers: 4
+float_epochs: 10
+float_learning_rate: 0.001
+# QAT starts from checkpoints/float_model.pth and uses a lower learning rate.
+qat_epochs: 5
+qat_learning_rate: 0.0001

@@ -1,0 +1,34 @@
+# Python bytecode, virtual environments, and local tooling
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+.vscode/
+
+# Downloaded MNIST data and training checkpoints
+CNN_FPGA/data/
+CNN_FPGA/checkpoints/*
+!CNN_FPGA/checkpoints/.gitkeep
+*.pth
+*.pt
+*.ckpt
+
+# Generated FPGA parameter exports (NPY/JSON/BIN/headers belong here)
+CNN_FPGA/generated/*
+!CNN_FPGA/generated/.gitkeep
+
+# Common FPGA/HLS build products; future source headers remain tracked
+.Xil/
+*.jou
+*.log
+*.str
+*.wdb
+*.xclbin
+*.xo
+*.bit
+*.ltx
