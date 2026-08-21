@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 import torch
-from torch.ao.quantization import FakeQuantize, MovingAverageMinMaxObserver, PerChannelMinMaxObserver, QConfig
+from torch.ao.quantization import FakeQuantize, MovingAverageMinMaxObserver, MovingAveragePerChannelMinMaxObserver, QConfig, prepare_qat
 
 from model import MnistCnn
 
@@ -20,7 +20,7 @@ def create_fpga_qconfig() -> QConfig:
         reduce_range=False,
     )
     weight = FakeQuantize.with_args(
-        observer=PerChannelMinMaxObserver,
+        observer=MovingAveragePerChannelMinMaxObserver,
         quant_min=-128,
         quant_max=127,
         dtype=torch.qint8,
@@ -32,12 +32,12 @@ def create_fpga_qconfig() -> QConfig:
 
 def prepare_qat_model(float_checkpoint: str | Path, device: torch.device) -> MnistCnn:
     """Load an FP32 checkpoint and prepare it for fine-tuning with official PyTorch QAT."""
-    checkpoint = torch.load(float_checkpoint, map_location="cpu", weights_only=False)
+    checkpoint: Dict[str, Any] = torch.load(float_checkpoint, map_location="cpu", weights_only=False)
     model = MnistCnn()
     model.load_state_dict(checkpoint["model_state_dict"])
     model.fuse_model()
     model.qconfig = create_fpga_qconfig()  # type: ignore
-    torch.ao.quantization.prepare_qat(model, inplace=True)
+    prepare_qat(model, inplace=True)
     return model.to(device)
 
 
@@ -47,7 +47,7 @@ def load_qat_model(qat_checkpoint: str | Path, device: torch.device) -> MnistCnn
     model = MnistCnn()
     model.fuse_model()
     model.qconfig = create_fpga_qconfig()  # type: ignore
-    torch.ao.quantization.prepare_qat(model, inplace=True)
+    prepare_qat(model, inplace=True)
     model.load_state_dict(checkpoint["model_state_dict"])
     return model.to(device)
 

@@ -2,7 +2,7 @@
 
 import torch
 from torch import nn
-from torch.ao.quantization import DeQuantStub, QuantStub
+from torch.ao.quantization import DeQuantStub, QuantStub, fuse_modules
 
 
 class MnistCnn(nn.Module):
@@ -33,4 +33,4 @@ class MnistCnn(nn.Module):
 
     def fuse_model(self) -> None:
         """Fuse Conv+ReLU pairs before QAT, as required by eager-mode quantization."""
-        torch.ao.quantization.fuse_modules(self, [["conv1", "relu1"], ["conv2", "relu2"]], inplace=True)
+        fuse_modules(self, [["conv1", "relu1"], ["conv2", "relu2"]], inplace=True)
