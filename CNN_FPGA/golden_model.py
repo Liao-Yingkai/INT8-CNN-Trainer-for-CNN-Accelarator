@@ -107,9 +107,9 @@ def load_metadata() -> Dict[str, Any]:
         raise FileNotFoundError("generated/metadata.json is missing. Run `python export.py` first.")
     with metadata_path.open("r", encoding="utf-8") as file:
         metadata: Dict[str, Any] = json.load(file)
-    if int(metadata.get("format_version", 0)) < 3:
+    if int(metadata.get("format_version", 0)) < 4:
         raise ValueError(
-            "golden_model.py requires metadata format_version >= 3. "
+            "golden_model.py requires metadata format_version >= 4. "
             "Run the updated `python export.py` to regenerate NHWC-compatible FC weights."
         )
     if metadata.get("hardware_feature_layout") != "NHWC":
@@ -159,17 +159,14 @@ def load_fixed_layers(metadata: Dict[str, Any]) -> Dict[str, FixedLayer]:
         if output_zero_points != [0]:
             raise ValueError(f"{name}: hardware simulation requires symmetric activation zero_point=0.")
         if name == "fc":
-            if entry.get("source_input_layout") != "CHW" or entry.get("export_input_layout") != "HWC":
-                raise ValueError("fc: expected an offline CHW-to-HWC weight conversion.")
-            shape_chw = entry.get("logical_input_shape_chw")
-            shape_hwc = entry.get("logical_input_shape_hwc")
-            if not isinstance(shape_chw, list) or len(shape_chw) != 3:
-                raise ValueError("fc: logical_input_shape_chw must contain [C, H, W].")
-            channels, height, width = (int(value) for value in shape_chw)
-            if shape_hwc != [height, width, channels]:
-                raise ValueError("fc: logical HWC shape is inconsistent with its CHW shape.")
-            if channels * height * width != original_shape[1]:
-                raise ValueError("fc: logical input shape does not match Linear input_features.")
+            if entry.get("source_input_order") != "C,S" or entry.get("export_input_order") != "S,C":
+                raise ValueError("fc: expected an offline [C,S]-to-[S,C] weight conversion.")
+            input_channels = int(entry.get("input_channels", 0))
+            spatial_elements = int(entry.get("spatial_elements", 0))
+            if input_channels <= 0 or spatial_elements <= 0:
+                raise ValueError("fc: input_channels and spatial_elements must be positive.")
+            if input_channels * spatial_elements != original_shape[1]:
+                raise ValueError("fc: C*S does not match Linear input_features.")
 
         layers[name] = FixedLayer(
             name=name,

@@ -256,7 +256,7 @@ generated/
 
 `.npy` 文件用于 Python 验证；`.h` 文件可直接作为后续 HLS 工程的参数输入；`metadata.json` 记录 shape、layout、scale、zero-point、bias scale、requant 参数和文件路径。
 
-metadata 当前格式版本为 3。该版本明确区分 PyTorch 的 NCHW 布局与硬件的 NHWC 布局，并记录 FC 权重已从 CHW 输入顺序离线重排为 HWC 输入顺序。
+metadata 当前格式版本为 4。该版本明确区分 PyTorch 的 NCHW 布局与硬件的 NHWC 布局，并用 `C,S → S,C` 描述 FC 输入维度的离线重排，其中 `S = H×W`。
 
 ### 5. 黄金模型验证
 
@@ -309,39 +309,38 @@ PyTorch Conv2d 权重布局为：
 
 Conv 的 K 维顺序对应 `[KH, KW, IC]`。后续硬件侧生成卷积窗口时必须采用相同的展平顺序。
 
-PyTorch 的 FC 原始权重按照 NCHW feature map 的 CHW flatten 顺序训练：
+PyTorch 的 FC 原始权重按照 NCHW feature map 的 CHW flatten 顺序训练。由于 NCHW→NHWC 不改变 H、W 的相对顺序，可以将两个空间维合并为 `S = H×W`：
 
 ```text
-[OC, C×H×W]
+[OC, C×S]
 ```
 
-FPGA 卷积输出保持 NHWC，直接 flatten 后的输入顺序为 HWC。为了避免硬件运行时执行 NHWC→NCHW feature-map 重排，FC 权重在导出阶段离线转换：
+FPGA 卷积输出保持 NHWC，直接 flatten 后的输入顺序为 `[S,C]`。为了避免硬件运行时执行 NHWC→NCHW feature-map 重排，FC 权重在导出阶段离线转换：
 
 ```text
-[OC, C×H×W]
-→ [OC, C, H, W]
-→ [H, W, C, OC]
-→ [H×W×C, OC]
+[OC, C×S]
+→ [OC, C, S]
+→ [S, C, OC]
+→ [S×C, OC]
 ```
 
 当前模型对应：
 
 ```text
 [10, 784]
-→ [10, 16, 7, 7]
-→ [7, 7, 16, 10]
+→ [10, 16, 49]
+→ [49, 16, 10]
 → [784, 10]
 ```
 
-`export.py` 不硬编码 `[16, 7, 7]`。它从最后一个卷积层的 `out_channels` 获取 C，从全连接层的 `in_features` 获取 `C×H×W`，并在当前方形 feature map（`H == W`）约束下使用整数平方根自动推导 H 和 W：
+`export.py` 从最后一个卷积层的 `out_channels` 自动获取 C，并根据 FC 权重的 `input_features` 计算空间元素数量 S：
 
 ```text
 C = conv2.out_channels
-H×W = fc.in_features / C
-H = W = isqrt(H×W)
+S = fc.in_features / C
 ```
 
-导出时会检查整除关系和平方关系；如果未来模型使用非方形 feature map，则需要由模型或导出配置显式提供 H/W，不能仅凭 Conv 和 FC 权重唯一推导。
+导出时只需检查 `fc.in_features` 能否被 C 整除，不需要推导独立的 H、W，也不要求 feature map 为方形。
 
 因此硬件可将 `[N, 7, 7, 16]` 的 NHWC 输出直接按 HWC 顺序 flatten 后送入 FC，无需转回 NCHW。FC 导出前后的矩阵 shape 仍是 `[784, 10]`，但 K 维内部的数据顺序已经改变。
 

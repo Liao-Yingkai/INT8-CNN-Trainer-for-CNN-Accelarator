@@ -139,47 +139,23 @@ def convert_conv_weight_layout(weight_int8: np.ndarray) -> Tuple[np.ndarray, str
     return np.ascontiguousarray(exported), "[OC,IC,KH,KW] -> [KH,KW,IC,OC] -> [K_HWC,OC]"
 
 
-def infer_linear_input_shape_chw(output_channels: int,
-                                 input_features: int) -> Tuple[int, int, int]:
-    """Infer square FC input shape from the final Conv channels and FC feature count."""
-    spatial_size, remainder = divmod(input_features, output_channels)
-    if remainder != 0:
-        raise ValueError(
-            f"Linear input_features={input_features} is not divisible by "
-            f"the final Conv output_channels={output_channels}."
-        )
-    spatial_side = math.isqrt(spatial_size)
-    if spatial_side * spatial_side != spatial_size:
-        raise ValueError(
-            f"Cannot infer a square H=W feature map from {spatial_size} spatial values."
-        )
-    return output_channels, spatial_side, spatial_side
-
-
 def convert_linear_weight_layout(weight_int8: np.ndarray,
-                                 input_shape_chw: Tuple[int, int, int]) -> Tuple[np.ndarray, str]:
+                                 input_channels: int) -> Tuple[np.ndarray, str]:
     """Reorder FC weights so an NHWC feature map can be flattened directly.
 
-    PyTorch trained each FC row against a CHW-flattened feature map.  The FPGA
-    convolution pipeline emits NHWC, so the K dimension is permuted offline
-    from CHW to HWC while the output-feature dimension remains unchanged.
+    H and W retain their relative order when NCHW changes to NHWC, so they are
+    treated as one spatial dimension S=H*W.  The offline permutation is simply
+    [OC,C,S] -> [S,C,OC] -> [K,OC]; separate H/W values are unnecessary.
     """
     if weight_int8.ndim != 2:
         raise ValueError(f"Linear weight must be [OC, K], got shape {weight_int8.shape}.")
     output_features, input_features = weight_int8.shape
-    channels, height, width = input_shape_chw
-    if channels * height * width != input_features:
-        raise ValueError(
-            f"Linear input shape {input_shape_chw} contains {channels * height * width} values, "
-            f"but weight expects {input_features}."
-        )
-
     exported = (
-        weight_int8.reshape(output_features, channels, height, width)
-        .transpose(2, 3, 1, 0)
+        weight_int8.reshape(output_features, input_channels, -1)
+        .transpose(2, 1, 0)
         .reshape(input_features, output_features)
     )
-    return np.ascontiguousarray(exported), "[OC,C,H,W] -> [H,W,C,OC] -> [K_HWC,OC]"
+    return np.ascontiguousarray(exported), "[OC,C,S] -> [S,C,OC] -> [K_HWC,OC]"
 
 
 def save_npy(path: Path, array: np.ndarray) -> None:
@@ -209,7 +185,7 @@ def export_layer(name: str, layer: nn.Module, input_scale: float,
                  output_scale: float, output_zero_point: np.ndarray,
                  weights_dir: Path, biases_dir: Path, quant_params_dir: Path,
                  headers_dir: Path,
-                 linear_input_shape_chw: Tuple[int, int, int] | None = None) -> Dict[str, Any]:
+                 linear_input_channels: int | None = None) -> Dict[str, Any]:
     """Export one Conv/Linear layer and return all HLS-relevant metadata."""
     weight_scale, weight_zero_point = extract_fake_quant_params(layer.weight_fake_quant)
     require_symmetric_zero_point(f"{name} weight", weight_zero_point)
@@ -218,10 +194,10 @@ def export_layer(name: str, layer: nn.Module, input_scale: float,
     weight_int8 = quantize_weight_per_channel(layer.weight, weight_scale, weight_zero_point)
     if weight_int8.ndim == 4:
         exported_weight, layout = convert_conv_weight_layout(weight_int8)
-    elif weight_int8.ndim == 2 and linear_input_shape_chw is not None:
-        exported_weight, layout = convert_linear_weight_layout(weight_int8, linear_input_shape_chw)
+    elif weight_int8.ndim == 2 and linear_input_channels is not None:
+        exported_weight, layout = convert_linear_weight_layout(weight_int8, linear_input_channels)
     else:
-        raise ValueError(f"{name}: Linear export requires linear_input_shape_chw.")
+        raise ValueError(f"{name}: Linear export requires linear_input_channels.")
     bias_int32 = convert_bias_to_int32(layer.bias, input_scale, weight_scale)
     multiplier, shift, real_multiplier = calculate_requant_params(input_scale, weight_scale, output_scale)
 
@@ -270,14 +246,14 @@ def export_layer(name: str, layer: nn.Module, input_scale: float,
             "shift_header": f"headers/{name}_shift.h",
         },
     }
-    if linear_input_shape_chw is not None:
-        channels, height, width = linear_input_shape_chw
+    if linear_input_channels is not None:
+        spatial_elements = weight_int8.shape[1] // linear_input_channels
         layer_metadata.update(
             {
-                "source_input_layout": "CHW",
-                "export_input_layout": "HWC",
-                "logical_input_shape_chw": [channels, height, width],
-                "logical_input_shape_hwc": [height, width, channels],
+                "input_channels": linear_input_channels,
+                "spatial_elements": spatial_elements,
+                "source_input_order": "C,S",
+                "export_input_order": "S,C",
             }
         )
     return layer_metadata
@@ -321,11 +297,6 @@ def main() -> None:
     conv1_output_scale = scalar_activation_scale(conv1_output_scale_array, "conv1 output")
     conv2_output_scale = scalar_activation_scale(conv2_output_scale_array, "conv2 output")
     fc_output_scale = scalar_activation_scale(fc_output_scale_array, "fc output")
-    linear_input_shape_chw = infer_linear_input_shape_chw(
-        output_channels=model.conv2.out_channels,
-        input_features=model.fc.in_features,
-    )
-
     layers = [
         export_layer("conv1", model.conv1, input_scale, conv1_output_scale, conv1_output_zero_point,
                      weights_dir, biases_dir, quant_params_dir, headers_dir),
@@ -333,10 +304,10 @@ def main() -> None:
                      weights_dir, biases_dir, quant_params_dir, headers_dir),
         export_layer("fc", model.fc, conv2_output_scale, fc_output_scale, fc_output_zero_point,
                      weights_dir, biases_dir, quant_params_dir, headers_dir,
-                     linear_input_shape_chw=linear_input_shape_chw),
+                     linear_input_channels=model.conv2.out_channels),
     ]
     metadata: Dict[str, Any] = {
-        "format_version": 3,
+        "format_version": 4,
         "pytorch_tensor_layout": "NCHW",
         "hardware_feature_layout": "NHWC",
         "hardware_datatypes": {"input": "int8", "weight": "int8", "accumulator": "int32", "bias": "int32"},
