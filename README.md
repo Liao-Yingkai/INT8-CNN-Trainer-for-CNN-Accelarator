@@ -258,6 +258,80 @@ generated/
 
 metadata 当前格式版本为 4。该版本明确区分 PyTorch 的 NCHW 布局与硬件的 NHWC 布局，并用 `C,S → S,C` 描述 FC 输入维度的离线重排，其中 `S = H×W`。
 
+### 导出数据说明
+
+`export.py` 生成的数据按“权重、bias、量化参数、C header、元数据”分开保存。数组类型和 shape 如下：
+
+| 路径 | 内容 | 类型 | Conv shape | FC shape |
+| --- | --- | --- | --- | --- |
+| `weights/*_weight_int8.npy` | 经过 FakeQuant scale 量化并完成 layout 转换的 weight | `numpy.int8` | `[K, OC]` | `[K, OC]` |
+| `biases/*_bias_int32.npy` | 按输入 scale 和 weight scale 转换的 bias | `numpy.int32` | `[OC]` | `[OC]` |
+| `quant_params/*_weight_scale.npy` | QAT weight FakeQuant 的 per-channel scale | `numpy.float32` | `[OC]` | `[OC]` |
+| `quant_params/*_weight_zero_point.npy` | weight zero-point | `numpy.int32` | `[OC]` | `[OC]` |
+| `quant_params/*_input_scale.npy` | 当前计算层输入 activation scale | `numpy.float32` | `[1]` | `[1]` |
+| `quant_params/*_output_scale.npy` | 当前计算层输出 activation scale | `numpy.float32` | `[1]` | `[1]` |
+| `quant_params/*_multiplier_int32.npy` | 每个输出通道的 requant multiplier | `numpy.int32` | `[OC]` | `[OC]` |
+| `quant_params/*_shift_int32.npy` | 每个输出通道的 requant shift | `numpy.int32` | `[OC]` | `[OC]` |
+
+其中，`quant_params/` 中的浮点 scale 主要用于 Python 检查和离线分析；FPGA 推理不应读取浮点 scale 来完成 requant，而应使用导出的 `multiplier` 和 `shift`。
+
+`headers/` 保存与上述 NPY 数组内容相同的 C 常量，便于 HLS 工程直接 include：
+
+```cpp
+const int8_t  conv1_weight[];
+const int32_t conv1_bias[];
+const int32_t conv1_multiplier[];
+const int32_t conv1_shift[];
+```
+
+当前不会生成 scale 的 C header；scale、zero-point 和完整布局信息统一记录在 `metadata.json` 及 `quant_params/` 中。
+
+### `export.py` 的导出逻辑
+
+导出脚本的主要步骤如下：
+
+1. 按 `MnistCnn → fuse_model → create_fpga_qconfig → prepare_qat → load_state_dict` 恢复 QAT 模型。QAT checkpoint 不能直接作为普通 FP32 模型读取。
+2. 从每个计算层的 `weight_fake_quant.calculate_qparams()` 读取 per-channel `weight_scale` 和 `weight_zero_point`。
+3. 对 FP32 `module.weight` 按输出通道执行：
+
+   ```text
+   weight_int8[channel] = round(weight_fp32[channel] / weight_scale[channel])
+   ```
+
+   结果夹紧到 `[-128,127]` 后保存为 INT8。由于配置为 symmetric，weight zero-point 应为 0。
+4. 转换 weight layout：
+
+   - Conv：`[OC,IC,KH,KW] → [KH,KW,IC,OC] → [KH×KW×IC,OC]`；
+   - FC：原始 PyTorch FC 输入顺序是 `[C,S]`，其中 `S=H×W`；硬件 NHWC flatten 顺序是 `[S,C]`，因此执行 `[OC,C,S] → [S,C,OC] → [S×C,OC]`。
+
+   FC 的通道数 C 从最后一个 Conv 的 `out_channels` 自动获取，空间元素数由 `fc.in_features / C` 得到，不需要单独推断 H 和 W。
+5. 从 activation FakeQuant 读取 per-tensor activation scale。第一层使用模型输入 scale，后续层使用前一层输出 scale；activation zero-point 为 0。
+6. 按输出通道把 bias 转换为 INT32：
+
+   ```text
+   bias_int32[channel] = round(
+       bias_fp32[channel] /
+       (input_scale × weight_scale[channel])
+   )
+   ```
+
+7. 计算每个输出通道的真实 requant 比例，并编码为整数 multiplier/shift：
+
+   ```text
+   real_multiplier[channel]
+       = input_scale × weight_scale[channel] / output_scale
+
+   real_multiplier ≈ multiplier[channel] / 2^shift[channel]
+   ```
+
+   HLS 侧可使用等价的整数形式：
+
+   ```text
+   output_int8 ≈ (acc_int32 × multiplier) >> shift
+   ```
+
+8. 将 NPY、C header 和 `metadata.json` 写入 `generated/`，并在终端打印每层原始 weight shape、导出 shape、scale 数量和 bias 数量。
+
 ### 5. 黄金模型验证
 
 ```bash
