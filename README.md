@@ -103,6 +103,7 @@ output_int8 ≈ (acc_int32 × multiplier) >> shift
     ├── evaluate.py           # FP32 与 QAT 准确率比较
     ├── export.py             # INT8/INT32 参数和 C header 导出
     ├── golden_model.py       # 导出参数的整数黄金验证模型
+    ├── dump_trace.py         # 单图模块边界数据导出
     ├── observe_weight.py     # 打印 FP32/QAT checkpoint state_dict
     ├── config.yaml           # 训练超参数
     ├── checkpoints/          # 训练 checkpoint（Git 忽略）
@@ -251,6 +252,8 @@ generated/
 │   ├── *_bias.h
 │   ├── *_quant.h
 │   └── *_shift.h
+├── trace/
+│   └── trace_data.h
 └── metadata.json
 ```
 
@@ -348,7 +351,65 @@ python golden_model.py
 
 当前脚本固定验证 1000 个 MNIST 测试样本，不需要命令行参数。运行前必须已生成 `qat_model.pth` 和 `generated/metadata.json`/headers。
 
-### 6. 查看 checkpoint 内容（可选）
+### 6. 导出单图模块边界数据
+
+```bash
+python dump_trace.py
+```
+
+脚本会从 MNIST 测试集中随机选择一张图片；如果本地没有测试集，会自动下载到 `CNN_FPGA/data/`。脚本使用与训练相同的 `ToTensor()` 和 Normalize，并调用 `golden_model.py` 中已有的定点推理逻辑，不重新实现卷积。
+
+默认使用 `seed=1` 选择测试图片。如需选择其他可复现样本，可以指定随机种子：
+
+```bash
+python dump_trace.py --seed 123
+```
+
+运行时会打印所选测试样本的 index 和 label。
+
+输出文件为：
+
+```text
+generated/trace/trace_data.h
+```
+
+该 header 可以直接被 HLS CSim include。它包含以下模块边界数据：
+
+| 数组 | 类型 | shape | 语义 |
+| --- | --- | --- | --- |
+| `trace_input_int8_hwc` | `int8_t` | `[28,28,1]` | 量化后的输入 |
+| `trace_conv1_unfold_int8` | `int8_t` | `[784,9]` | Conv1 的 im2row/unfold 输出 |
+| `trace_conv1_systolic_int32_nhwc` | `int32_t` | `[28,28,8]` | Conv1 MAC，未加 bias |
+| `trace_conv1_postprocess_int32_nhwc` | `int32_t` | `[28,28,8]` | Conv1 加 bias、ReLU 后 |
+| `trace_conv1_requant_int8_nhwc` | `int8_t` | `[28,28,8]` | Conv1 requant 后 |
+| `trace_pool1_int8_nhwc` | `int8_t` | `[14,14,8]` | MaxPool1 后 |
+| `trace_conv2_unfold_int8` | `int8_t` | `[196,72]` | Conv2 的 im2row/unfold 输出 |
+| `trace_conv2_systolic_int32_nhwc` | `int32_t` | `[14,14,16]` | Conv2 MAC，未加 bias |
+| `trace_conv2_postprocess_int32_nhwc` | `int32_t` | `[14,14,16]` | Conv2 加 bias、ReLU 后 |
+| `trace_conv2_requant_int8_nhwc` | `int8_t` | `[14,14,16]` | Conv2 requant 后 |
+| `trace_pool2_int8_nhwc` | `int8_t` | `[7,7,16]` | MaxPool2 后 |
+| `trace_fc_systolic_int32` | `int32_t` | `[10]` | FC MAC，未加 bias |
+| `trace_fc_postprocess_int32` | `int32_t` | `[10]` | FC 加 bias 后 |
+| `trace_fc_requant_int8` | `int8_t` | `[10]` | FC requant 后 |
+
+Conv 的 postprocess 输出包含 ReLU。当前模型 FC 后没有 ReLU，因此 FC postprocess 只包含 bias 加法。systolic 和 postprocess 阶段本质上是 INT32，requant 和池化输出是 INT8；脚本会在写出前检查每个数组的 dtype 和取值范围。
+
+两个 `unfold` 数组是卷积 systolic 输入的直接参考数据，采用 `[OH×OW, KH×KW×Cin]` 排布。每一行对应一个输出像素，列顺序为 `[KH, KW, Cin]`，与导出的卷积权重 `[KH, KW, Cin, Cout] → [K, Cout]` 相匹配；padding=1 的边界位置使用量化零值填充。
+
+HLS CSim 中可直接使用：
+
+```cpp
+#include "trace_data.h"
+
+// 例如比较 Conv1 requant 输出
+if (conv1_output[y][x][c] != trace_conv1_requant_int8_nhwc[(y * 28 + x) * 8 + c]) {
+    // report mismatch
+}
+```
+
+该 trace 文件不包含额外 JSON metadata、scale 或浮点数据；shape 通过 C 数组声明和 header 注释给出，量化参数继续使用 `generated/headers/` 中的导出参数。
+
+### 7. 查看 checkpoint 内容（可选）
 
 ```bash
 python observe_weight.py

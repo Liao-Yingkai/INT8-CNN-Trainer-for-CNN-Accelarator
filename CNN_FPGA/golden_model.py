@@ -240,8 +240,8 @@ def requantize_accumulator(accumulator: np.ndarray, layer: FixedLayer,
     return np.clip(requantized, INT8_MIN, INT8_MAX).astype(np.int8)
 
 
-def fixed_conv2d_nhwc(input_nhwc: np.ndarray, layer: FixedLayer) -> Tuple[np.ndarray, np.ndarray]:
-    """Run one padded 3x3 convolution using exported ``[K, OC]`` INT8 weights."""
+def fixed_conv2d_nhwc(input_nhwc: np.ndarray, layer: FixedLayer) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Run one Conv pipeline and return unfold plus module-boundary outputs."""
     if len(layer.original_weight_shape) != 4:
         raise ValueError(f"{layer.name}: expected a four-dimensional convolution weight.")
     output_channels, input_channels, kernel_h, kernel_w = layer.original_weight_shape
@@ -251,12 +251,21 @@ def fixed_conv2d_nhwc(input_nhwc: np.ndarray, layer: FixedLayer) -> Tuple[np.nda
     if input_matrix.shape[1] != layer.weight.shape[0] or layer.weight.shape[1] != output_channels:
         raise ValueError(f"{layer.name}: preprocessed input and exported weight matrix are incompatible.")
 
-    accumulator_int64 = input_matrix.astype(np.int64) @ layer.weight.astype(np.int64)
-    accumulator_int64 += layer.bias.astype(np.int64)
-    accumulator = check_int32_accumulator(layer.name, accumulator_int64)
-    output_int8 = requantize_accumulator(accumulator, layer, apply_relu=True)
+    systolic_int64 = input_matrix.astype(np.int64) @ layer.weight.astype(np.int64)
+    systolic = check_int32_accumulator(f"{layer.name} systolic", systolic_int64)
+    postprocess_int64 = systolic.astype(np.int64) + layer.bias.astype(np.int64)
+    postprocess = check_int32_accumulator(f"{layer.name} postprocess", postprocess_int64)
+    postprocess = np.maximum(postprocess, 0).astype(np.int32)
+    output_int8 = requantize_accumulator(postprocess, layer, apply_relu=False)
     batch = input_nhwc.shape[0]
-    return output_int8.reshape(batch, output_h, output_w, output_channels), accumulator
+    output_shape = (batch, output_h, output_w, output_channels)
+    unfold = input_matrix.reshape(batch, output_h * output_w, input_matrix.shape[1])
+    return output_int8.reshape(output_shape), {
+        "unfold": unfold,
+        "systolic": systolic.reshape(output_shape),
+        "postprocess": postprocess.reshape(output_shape),
+        "requant": output_int8.reshape(output_shape),
+    }
 
 
 def max_pool2x2_nhwc(input_nhwc: np.ndarray) -> np.ndarray:
@@ -268,14 +277,21 @@ def max_pool2x2_nhwc(input_nhwc: np.ndarray) -> np.ndarray:
     return blocked.max(axis=(2, 4))
 
 
-def fixed_linear(input_matrix: np.ndarray, layer: FixedLayer) -> Tuple[np.ndarray, np.ndarray]:
-    """Run the exported FC matrix ``[784, 10]`` with INT32 accumulation."""
+def fixed_linear(input_matrix: np.ndarray, layer: FixedLayer) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Run the exported FC pipeline and return INT32 stages plus INT8 output."""
     if input_matrix.ndim != 2 or input_matrix.shape[1] != layer.weight.shape[0]:
         raise ValueError(f"{layer.name}: FC input {input_matrix.shape} is incompatible with {layer.weight.shape}.")
-    accumulator_int64 = input_matrix.astype(np.int64) @ layer.weight.astype(np.int64)
-    accumulator_int64 += layer.bias.astype(np.int64)
-    accumulator = check_int32_accumulator(layer.name, accumulator_int64)
-    return requantize_accumulator(accumulator, layer, apply_relu=False), accumulator
+    systolic_int64 = input_matrix.astype(np.int64) @ layer.weight.astype(np.int64)
+    systolic = check_int32_accumulator(f"{layer.name} systolic", systolic_int64)
+    postprocess = check_int32_accumulator(
+        f"{layer.name} postprocess", systolic.astype(np.int64) + layer.bias.astype(np.int64)
+    )
+    output_int8 = requantize_accumulator(postprocess, layer, apply_relu=False)
+    return output_int8, {
+        "systolic": systolic,
+        "postprocess": postprocess,
+        "requant": output_int8,
+    }
 
 
 def run_fixed_model(input_nchw: np.ndarray, input_scale: float,
@@ -284,17 +300,35 @@ def run_fixed_model(input_nchw: np.ndarray, input_scale: float,
     input_int8_nchw = quantize_symmetric_int8(input_nchw, input_scale)
     input_int8_nhwc = np.ascontiguousarray(input_int8_nchw.transpose(0, 2, 3, 1))
 
-    conv1, _ = fixed_conv2d_nhwc(input_int8_nhwc, layers["conv1"])
+    conv1, conv1_stages = fixed_conv2d_nhwc(input_int8_nhwc, layers["conv1"])
     pool1 = max_pool2x2_nhwc(conv1)
-    conv2, _ = fixed_conv2d_nhwc(pool1, layers["conv2"])
+    conv2, conv2_stages = fixed_conv2d_nhwc(pool1, layers["conv2"])
     pool2 = max_pool2x2_nhwc(conv2)
 
     # Conv2/Pool2 already emit NHWC.  The exported FC rows were reordered from
     # PyTorch CHW to HWC offline, so hardware can flatten the feature map
     # directly without a runtime NHWC-to-NCHW transpose.
     fc_input = np.ascontiguousarray(pool2).reshape(pool2.shape[0], -1)
-    fc, _ = fixed_linear(fc_input, layers["fc"])
-    return {"input": input_int8_nhwc, "conv1": conv1, "pool1": pool1, "conv2": conv2, "pool2": pool2, "fc": fc}
+    fc, fc_stages = fixed_linear(fc_input, layers["fc"])
+    return {
+        "input": input_int8_nhwc,
+        "conv1": conv1,
+        "pool1": pool1,
+        "conv2": conv2,
+        "pool2": pool2,
+        "fc": fc,
+        "conv1_unfold": conv1_stages["unfold"],
+        "conv1_systolic": conv1_stages["systolic"],
+        "conv1_postprocess": conv1_stages["postprocess"],
+        "conv1_requant": conv1_stages["requant"],
+        "conv2_unfold": conv2_stages["unfold"],
+        "conv2_systolic": conv2_stages["systolic"],
+        "conv2_postprocess": conv2_stages["postprocess"],
+        "conv2_requant": conv2_stages["requant"],
+        "fc_systolic": fc_stages["systolic"],
+        "fc_postprocess": fc_stages["postprocess"],
+        "fc_requant": fc_stages["requant"],
+    }
 
 
 def register_qat_capture_hooks(model: torch.nn.Module) -> Tuple[Dict[str, torch.Tensor], List[torch.utils.hooks.RemovableHandle]]:
