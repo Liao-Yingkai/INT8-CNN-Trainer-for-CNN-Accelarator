@@ -103,7 +103,7 @@ output_int8 ≈ (acc_int32 × multiplier) >> shift
     ├── evaluate.py           # FP32 与 QAT 准确率比较
     ├── export.py             # INT8/INT32 参数和 C header 导出
     ├── golden_model.py       # 导出参数的整数黄金验证模型
-    ├── dump_trace.py         # 单图模块边界数据导出
+    ├── dump_trace.py         # 测试图模块边界数据导出
     ├── observe_weight.py     # 打印 FP32/QAT checkpoint state_dict
     ├── config.yaml           # 训练超参数
     ├── checkpoints/          # 训练 checkpoint（Git 忽略）
@@ -253,7 +253,7 @@ generated/
 │   ├── *_quant.h
 │   └── *_shift.h
 ├── trace/
-│   └── trace_data.h
+│   └── trace_data_*.h
 └── metadata.json
 ```
 
@@ -351,29 +351,40 @@ python golden_model.py
 
 当前脚本固定验证 1000 个 MNIST 测试样本，不需要命令行参数。运行前必须已生成 `qat_model.pth` 和 `generated/metadata.json`/headers。
 
-### 6. 导出单图模块边界数据
+### 6. 批量导出测试图模块边界数据
 
 ```bash
 python dump_trace.py
 ```
 
-脚本会从 MNIST 测试集中随机选择一张图片；如果本地没有测试集，会自动下载到 `CNN_FPGA/data/`。脚本使用与训练相同的 `ToTensor()` 和 Normalize，并调用 `golden_model.py` 中已有的定点推理逻辑，不重新实现卷积。
+脚本会从 MNIST 测试集中随机选择图片；如果本地没有测试集，会自动下载到 `CNN_FPGA/data/`。脚本使用与训练相同的 `ToTensor()` 和 Normalize，并调用 `golden_model.py` 中已有的定点推理逻辑，不重新实现卷积。
 
-默认使用 `seed=1` 选择测试图片。如需选择其他可复现样本，可以指定随机种子：
+通过 `--num-samples` 指定导出的图片数量，默认导出 1 张。样本从测试集不重复抽取，因此数量不能超过 MNIST 测试集大小（10000）：
 
 ```bash
-python dump_trace.py --seed 123
+python dump_trace.py --num-samples 10
 ```
 
-运行时会打印所选测试样本的 index 和 label。
+默认使用 `seed=1`。如需选择其他可复现的图片序列，可以指定随机种子：
 
-输出文件为：
+```bash
+python dump_trace.py --num-samples 10 --seed 123
+```
+
+运行时会打印每个样本在 MNIST 测试集中的 index 和 label。
+
+每个样本单独生成一个 header，文件名按导出顺序使用四位零填充后缀：
 
 ```text
-generated/trace/trace_data.h
+generated/trace/trace_data_0000.h
+generated/trace/trace_data_0001.h
+...
+generated/trace/trace_data_0009.h
 ```
 
-该 header 可以直接被 HLS CSim include。它包含以下模块边界数据：
+每次运行前会清理 `generated/trace/` 下由该脚本生成的旧 trace header，避免上一次数量较多时残留文件造成混淆。
+
+每个 header 都可以直接被 HLS CSim include，并包含同样命名的模块边界数组；一次 CSim 运行选择一个对应样本的 header 即可。header 注释中记录了导出序号、MNIST 测试集 index 和 label。每个文件包含：
 
 | 数组 | 类型 | shape | 语义 |
 | --- | --- | --- | --- |
@@ -399,7 +410,7 @@ Conv 的 postprocess 输出包含 ReLU。当前模型 FC 后没有 ReLU，因此
 HLS CSim 中可直接使用：
 
 ```cpp
-#include "trace_data.h"
+#include "trace_data_0000.h"
 
 // 例如比较 Conv1 requant 输出
 if (conv1_output[y][x][c] != trace_conv1_requant_int8_nhwc[(y * 28 + x) * 8 + c]) {

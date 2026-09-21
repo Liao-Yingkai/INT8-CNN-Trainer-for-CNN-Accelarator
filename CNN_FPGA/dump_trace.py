@@ -1,8 +1,8 @@
-"""Export one image's INT8/INT32 intermediate tensors for HLS C simulation."""
+"""Export MNIST test images' INT8/INT32 intermediate tensors for HLS C simulation."""
 
 import argparse
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 from torchvision import datasets, transforms
@@ -15,18 +15,33 @@ TRACE_DIR = GENERATED_DIR / "trace"
 MNIST_DATA_DIR = ROOT / "data"
 
 
-def load_random_test_image(seed: Optional[int] = None) -> Tuple[np.ndarray, int, int]:
-    """Select one MNIST test image and apply the training preprocessing pipeline."""
+def load_test_dataset() -> datasets.MNIST:
+    """Load the MNIST test set with the same preprocessing used during training."""
     transform = transforms.Compose(
         [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
     )
-    test_set = datasets.MNIST(
+    return datasets.MNIST(
         root=str(MNIST_DATA_DIR), train=False, transform=transform, download=True
     )
+
+
+def select_test_indices(dataset_size: int, num_samples: int, seed: int) -> List[int]:
+    """Select unique test-set indices in deterministic pseudo-random order."""
+    if num_samples < 1:
+        raise ValueError("num_samples must be at least 1.")
+    if num_samples > dataset_size:
+        raise ValueError(
+            f"num_samples={num_samples} exceeds the MNIST test-set size ({dataset_size}); "
+            "sampling is without replacement."
+        )
     rng = np.random.default_rng(seed)
-    sample_index = int(rng.integers(0, len(test_set)))
+    return [int(index) for index in rng.choice(dataset_size, size=num_samples, replace=False)]
+
+
+def load_test_sample(test_set: datasets.MNIST, sample_index: int) -> Tuple[np.ndarray, int]:
+    """Load one already-preprocessed test sample as a one-image NCHW batch."""
     image, label = test_set[sample_index]
-    return image.unsqueeze(0).numpy(), int(label), sample_index
+    return image.unsqueeze(0).numpy(), int(label)
 
 
 def validate_trace_tensor(name: str, array: np.ndarray, dtype: np.dtype) -> None:
@@ -47,14 +62,23 @@ def format_c_array(array: np.ndarray) -> str:
     return ",\n".join(lines)
 
 
-def write_trace_header(path: Path, tensors: Dict[str, np.ndarray]) -> None:
-    """Write all intermediate tensors into one directly includable C header."""
+def write_trace_header(
+    path: Path,
+    tensors: Dict[str, np.ndarray],
+    sequence: int,
+    sample_index: int,
+    label: int,
+) -> None:
+    """Write one image's intermediate tensors into a directly includable C header."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    include_guard = f"CNN_FPGA_TRACE_DATA_{sequence:04d}_H"
     lines = [
-        "#ifndef CNN_FPGA_TRACE_DATA_H",
-        "#define CNN_FPGA_TRACE_DATA_H",
+        f"#ifndef {include_guard}",
+        f"#define {include_guard}",
         "",
         "#include <stdint.h>",
+        "",
+        f"/* trace sequence={sequence}, MNIST test index={sample_index}, label={label} */",
         "",
     ]
     for name, array in tensors.items():
@@ -71,27 +95,13 @@ def write_trace_header(path: Path, tensors: Dict[str, np.ndarray]) -> None:
                 "",
             ]
         )
-    lines.append("#endif  // CNN_FPGA_TRACE_DATA_H")
+    lines.append(f"#endif  // {include_guard}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def main() -> None:
-    """Export one random MNIST test image and all FPGA module boundaries."""
-    parser = argparse.ArgumentParser(description="Export a random MNIST test image trace")
-    parser.add_argument(
-        "--seed", type=int, default=1,
-        help="random seed for selecting a reproducible test image (default: 1)",
-    )
-    args = parser.parse_args()
-
-    metadata = load_metadata()
-    model_input = metadata["model_input"]
-    input_scale = float(model_input["scale"])
-    layers = load_fixed_layers(metadata)
-    input_nchw, label, sample_index = load_random_test_image(args.seed)
-    trace = run_fixed_model(input_nchw, input_scale, layers)
-
-    tensors = {
+def build_trace_tensors(trace: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Select the input and module-boundary tensors written to each header."""
+    return {
         "input_int8_hwc": trace["input"][0],
         "conv1_unfold_int8": trace["conv1_unfold"][0],
         "conv1_systolic_int32_nhwc": trace["conv1_systolic"][0],
@@ -107,16 +117,65 @@ def main() -> None:
         "fc_postprocess_int32": trace["fc_postprocess"][0],
         "fc_requant_int8": trace["fc_requant"][0],
     }
+
+
+def validate_trace_tensors(tensors: Dict[str, np.ndarray]) -> None:
+    """Validate dtype and integer range for all exported tensors."""
     for name, array in tensors.items():
         expected_dtype = np.dtype(np.int32 if "int32" in name else np.int8)
         validate_trace_tensor(name, array, expected_dtype)
 
-    output_path = TRACE_DIR / "trace_data.h"
-    write_trace_header(output_path, tensors)
-    print(f"Selected MNIST test sample index={sample_index}, label={label}")
-    print(f"Wrote {len(tensors)} tensors to {output_path}")
-    for name, array in tensors.items():
-        print(f"  {name:36s} shape={str(array.shape):18s} dtype={array.dtype}")
+
+def clear_previous_trace_headers() -> int:
+    """Remove only headers generated by this script so a new batch is unambiguous."""
+    TRACE_DIR.mkdir(parents=True, exist_ok=True)
+    previous = list(TRACE_DIR.glob("trace_data_*.h"))
+    legacy_header = TRACE_DIR / "trace_data.h"
+    if legacy_header.exists():
+        previous.append(legacy_header)
+    for path in previous:
+        path.unlink()
+    return len(previous)
+
+
+def main() -> None:
+    """Export selected random MNIST test images and all FPGA module boundaries."""
+    parser = argparse.ArgumentParser(description="Export MNIST test-image traces for HLS C simulation")
+    parser.add_argument(
+        "-n", "--num-samples", "--num-images", dest="num_samples", type=int, default=1,
+        help="number of unique random test images to export (default: 1)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=1,
+        help="random seed for selecting a reproducible test-image sequence (default: 1)",
+    )
+    args = parser.parse_args()
+
+    metadata = load_metadata()
+    model_input = metadata["model_input"]
+    input_scale = float(model_input["scale"])
+    layers = load_fixed_layers(metadata)
+    test_set = load_test_dataset()
+    sample_indices = select_test_indices(len(test_set), args.num_samples, args.seed)
+    removed_count = clear_previous_trace_headers()
+    if removed_count:
+        print(f"Removed {removed_count} previous trace header(s).")
+
+    for sequence, sample_index in enumerate(sample_indices):
+        input_nchw, label = load_test_sample(test_set, sample_index)
+        trace = run_fixed_model(input_nchw, input_scale, layers)
+        tensors = build_trace_tensors(trace)
+        validate_trace_tensors(tensors)
+
+        output_path = TRACE_DIR / f"trace_data_{sequence:04d}.h"
+        write_trace_header(output_path, tensors, sequence, sample_index, label)
+        print(
+            f"[{sequence + 1}/{len(sample_indices)}] "
+            f"MNIST test index={sample_index}, label={label} -> {output_path}"
+        )
+        if sequence == 0:
+            for name, array in tensors.items():
+                print(f"  {name:36s} shape={str(array.shape):18s} dtype={array.dtype}")
 
 
 if __name__ == "__main__":
