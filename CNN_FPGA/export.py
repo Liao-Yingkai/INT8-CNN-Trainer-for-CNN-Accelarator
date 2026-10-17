@@ -164,7 +164,25 @@ def save_npy(path: Path, array: np.ndarray) -> None:
     np.save(path, np.ascontiguousarray(array))
 
 
-def export_header_file(path: Path, c_type: str, symbol: str, array: np.ndarray) -> None:
+def block_header_weight(logical: np.ndarray, original_shape: Tuple[int, ...]) -> Tuple[np.ndarray, str]:
+    """逻辑矩阵保持不变，仅将 header 重排为硬件紧凑分块布局。"""
+    if len(original_shape) == 4:
+        oc, ic, kh, kw = original_shape
+        if oc % 4:
+            raise ValueError("Conv output channels must be divisible by 4.")
+        blocked = logical.reshape(kh, kw, ic, oc // 4, 4).transpose(3, 0, 1, 4, 2)
+        layout = "[OC/4,KH,KW,4,IC]"
+    else:
+        k, oc = logical.shape
+        if oc != 10 or k != 784:
+            raise ValueError("FC hardware header requires logical shape [784,10].")
+        blocked = logical.reshape(98, 8, 2, 5).transpose(2, 0, 3, 1)
+        layout = "[2,98,5,8]"
+    return np.ascontiguousarray(blocked), layout
+
+
+def export_header_file(path: Path, c_type: str, symbol: str, array: np.ndarray,
+                       layout_version: int | None = None) -> None:
     """Write a C header containing one flattened constant tensor for HLS inclusion."""
     path.parent.mkdir(parents=True, exist_ok=True)
     values = np.asarray(array).reshape(-1)
@@ -174,8 +192,11 @@ def export_header_file(path: Path, c_type: str, symbol: str, array: np.ndarray) 
         rows.append(f"    {row}")
     initializer = ",\n".join(rows)
     guard = f"{symbol.upper()}_H"
+    version_define = (f"#define {symbol.upper()}_LAYOUT_VERSION {layout_version}\n\n"
+                      if layout_version is not None else "")
     path.write_text(
         f"#ifndef {guard}\n#define {guard}\n\n#include <stdint.h>\n\n"
+        f"{version_define}"
         f"const {c_type} {symbol}[] = {{\n{initializer}\n}};\n\n#endif  // {guard}\n",
         encoding="utf-8",
     )
@@ -210,7 +231,8 @@ def export_layer(name: str, layer: nn.Module, input_scale: float,
     save_npy(quant_params_dir / f"{name}_multiplier_int32.npy", multiplier)
     save_npy(quant_params_dir / f"{name}_shift_int32.npy", shift)
 
-    export_header_file(headers_dir / f"{name}_weight.h", "int8_t", f"{name}_weight", exported_weight)
+    header_weight, header_layout = block_header_weight(exported_weight, tuple(weight_int8.shape))
+    export_header_file(headers_dir / f"{name}_weight.h", "int8_t", f"{name}_weight", header_weight, 2)
     export_header_file(headers_dir / f"{name}_bias.h", "int32_t", f"{name}_bias", bias_int32)
     export_header_file(headers_dir / f"{name}_quant.h", "int32_t", f"{name}_multiplier", multiplier)
     export_header_file(headers_dir / f"{name}_shift.h", "int32_t", f"{name}_shift", shift)
@@ -222,6 +244,9 @@ def export_layer(name: str, layer: nn.Module, input_scale: float,
         "weight_dtype": "int8",
         "bias_dtype": "int32",
         "weight_layout": layout,
+        "weight_header_layout_version": 2,
+        "header_weight_shape": list(header_weight.shape),
+        "header_weight_layout": header_layout,
         "weight_scale": weight_scale.tolist(),
         "weight_zero_point": weight_zero_point.tolist(),
         "activation_input_scale": input_scale,
@@ -265,6 +290,7 @@ def print_layer_summary(metadata: Dict[str, Any]) -> None:
         print(f"{layer['name'].capitalize()}:")
         print(f"  weight original: {layer['original_weight_shape']}")
         print(f"  weight export:   {layer['export_weight_shape']}")
+        print(f"  weight header:   {layer['header_weight_shape']}")
         print(f"  scale count:     {len(layer['weight_scale'])}")
         print(f"  bias count:      {len(layer['bias_scale'])}")
         print("--------------------------------")
@@ -307,7 +333,7 @@ def main() -> None:
                      linear_input_channels=model.conv2.out_channels),
     ]
     metadata: Dict[str, Any] = {
-        "format_version": 4,
+        "format_version": 5,
         "pytorch_tensor_layout": "NCHW",
         "hardware_feature_layout": "NHWC",
         "hardware_datatypes": {"input": "int8", "weight": "int8", "accumulator": "int32", "bias": "int32"},

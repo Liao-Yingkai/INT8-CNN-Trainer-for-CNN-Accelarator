@@ -257,9 +257,9 @@ generated/
 └── metadata.json
 ```
 
-`.npy` 文件用于 Python 验证；`.h` 文件可直接作为后续 HLS 工程的参数输入；`metadata.json` 记录 shape、layout、scale、zero-point、bias scale、requant 参数和文件路径。
+`.npy` 权重保留用于数学分析的逻辑矩阵；`.h` 权重使用硬件紧凑分块顺序；`metadata.json` 分别记录两者的 shape/layout，以及 scale、zero-point、bias scale、requant 参数和文件路径。Golden 读取的是 `.h`，解码后进行整数计算，不读取权重 NPY。
 
-metadata 当前格式版本为 4。该版本明确区分 PyTorch 的 NCHW 布局与硬件的 NHWC 布局，并用 `C,S → S,C` 描述 FC 输入维度的离线重排，其中 `S = H×W`。
+metadata 当前格式版本为 5。PyTorch 的 NCHW 与硬件 NHWC 布局仍通过 FC 的 `C,S → S,C` 离线重排衔接，其中 `S = H×W`。`export_weight_shape` / `weight_layout` 描述逻辑矩阵；`header_weight_shape` / `header_weight_layout` 描述硬件 header；每层 `weight_header_layout_version=2`。旧 metadata/header 会明确报错，需运行新版 `export.py` 重导出。
 
 ### 导出数据说明
 
@@ -278,7 +278,15 @@ metadata 当前格式版本为 4。该版本明确区分 PyTorch 的 NCHW 布局
 
 其中，`quant_params/` 中的浮点 scale 主要用于 Python 检查和离线分析；FPGA 推理不应读取浮点 scale 来完成 requant，而应使用导出的 `multiplier` 和 `shift`。
 
-`headers/` 保存与上述 NPY 数组内容相同的 C 常量，便于 HLS 工程直接 include：
+`headers/` 的 bias、multiplier 和 shift 与 NPY 顺序相同；权重值相同但顺序不同。权重 header 保留原一维数组名称与元素数，并包含 `CONV1_WEIGHT_LAYOUT_VERSION`、`CONV2_WEIGHT_LAYOUT_VERSION` 或 `FC_WEIGHT_LAYOUT_VERSION` 宏，值均为 2，供消费端拒绝旧格式。
+
+| 权重 header | 紧凑分块 shape | INT8 字节数 |
+| --- | --- | --- |
+| `conv1_weight.h` | `[2,3,3,4,1]` | 72 |
+| `conv2_weight.h` | `[4,3,3,4,8]` | 1152 |
+| `fc_weight.h` | `[2,98,5,8]` | 7840 |
+
+Conv 顺序为 `[OC/4,KH,KW,4,IC实际]`，不为 IC 物理补零。FC 在 NHWC 数学重排后按 `[tile,token,lane,c]` 存储，扁平索引为 `((tile*98+token)*5+lane)*8+c`，对应逻辑矩阵 `weight[token*8+c, tile*5+lane]`。HLS 输入输出结构及事务不变。C 常量仍可直接 include：
 
 ```cpp
 const int8_t  conv1_weight[];
@@ -308,6 +316,7 @@ const int32_t conv1_shift[];
    - FC：原始 PyTorch FC 输入顺序是 `[C,S]`，其中 `S=H×W`；硬件 NHWC flatten 顺序是 `[S,C]`，因此执行 `[OC,C,S] → [S,C,OC] → [S×C,OC]`。
 
    FC 的通道数 C 从最后一个 Conv 的 `out_channels` 自动获取，空间元素数由 `fc.in_features / C` 得到，不需要单独推断 H 和 W。
+   上述 `[K,OC]` 保存为 NPY 逻辑矩阵；另按前述分块格式生成硬件权重 header，不改变计算、量化和 trace 的数学语义。
 5. 从 activation FakeQuant 读取 per-tensor activation scale。第一层使用模型输入 scale，后续层使用前一层输出 scale；activation zero-point 为 0。
 6. 按输出通道把 bias 转换为 INT32：
 
@@ -405,7 +414,7 @@ generated/trace/trace_data_0009.h
 
 Conv 的 postprocess 输出包含 ReLU。当前模型 FC 后没有 ReLU，因此 FC postprocess 只包含 bias 加法。systolic 和 postprocess 阶段本质上是 INT32，requant 和池化输出是 INT8；脚本会在写出前检查每个数组的 dtype 和取值范围。
 
-两个 `unfold` 数组是卷积 systolic 输入的直接参考数据，采用 `[OH×OW, KH×KW×Cin]` 排布。每一行对应一个输出像素，列顺序为 `[KH, KW, Cin]`，与导出的卷积权重 `[KH, KW, Cin, Cout] → [K, Cout]` 相匹配；padding=1 的边界位置使用量化零值填充。
+两个 `unfold` 数组是卷积 systolic 输入的直接参考数据，采用 `[OH×OW, KH×KW×Cin]` 排布。每一行对应一个输出像素，列顺序为 `[KH, KW, Cin]`，与解码后的逻辑卷积矩阵 `[KH, KW, Cin, Cout] → [K, Cout]` 相匹配（不是 header 的物理顺序）；padding=1 的边界位置使用量化零值填充。
 
 HLS CSim 中可直接使用：
 
@@ -436,7 +445,7 @@ PyTorch Conv2d 权重布局为：
 [OC, IC, KH, KW]
 ```
 
-为了适配后续 HLS 矩阵乘法接口，导出时转换为：
+数学分析及 NPY 使用以下逻辑矩阵转换（硬件 header 在此基础上再分块）：
 
 ```text
 [OC, IC, KH, KW]
@@ -447,11 +456,11 @@ PyTorch Conv2d 权重布局为：
 
 各层导出 shape：
 
-| 层 | PyTorch shape | HLS shape |
-| --- | --- | --- |
-| Conv1 | `[8, 1, 3, 3]` | `[9, 8]` |
-| Conv2 | `[16, 8, 3, 3]` | `[72, 16]` |
-| FC | `[10, 784]` | `[784, 10]` |
+| 层 | PyTorch shape | NPY / 逻辑矩阵 shape | 硬件 header shape |
+| --- | --- | --- | --- |
+| Conv1 | `[8, 1, 3, 3]` | `[9, 8]` | `[2,3,3,4,1]` |
+| Conv2 | `[16, 8, 3, 3]` | `[72, 16]` | `[4,3,3,4,8]` |
+| FC | `[10, 784]` | `[784, 10]` | `[2,98,5,8]` |
 
 Conv 的 K 维顺序对应 `[KH, KW, IC]`。后续硬件侧生成卷积窗口时必须采用相同的展平顺序。
 
@@ -488,7 +497,7 @@ S = fc.in_features / C
 
 导出时只需检查 `fc.in_features` 能否被 C 整除，不需要推导独立的 H、W，也不要求 feature map 为方形。
 
-因此硬件可将 `[N, 7, 7, 16]` 的 NHWC 输出直接按 HWC 顺序 flatten 后送入 FC，无需转回 NCHW。FC 导出前后的矩阵 shape 仍是 `[784, 10]`，但 K 维内部的数据顺序已经改变。
+因此硬件可将 `[N, 7, 7, 16]` 的 NHWC 输出直接按 HWC 顺序 flatten 后送入 FC，无需转回 NCHW。FC 用于数学计算的逻辑矩阵为 `[784, 10]`，K 维已从 CHW 重排为 HWC；硬件 header 进一步分块为 `[2,98,5,8]`。
 
 ## 常见问题
 

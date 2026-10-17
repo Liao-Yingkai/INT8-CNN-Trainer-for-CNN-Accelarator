@@ -107,10 +107,10 @@ def load_metadata() -> Dict[str, Any]:
         raise FileNotFoundError("generated/metadata.json is missing. Run `python export.py` first.")
     with metadata_path.open("r", encoding="utf-8") as file:
         metadata: Dict[str, Any] = json.load(file)
-    if int(metadata.get("format_version", 0)) < 4:
+    if metadata.get("format_version") != 5:
         raise ValueError(
-            "golden_model.py requires metadata format_version >= 4. "
-            "Run the updated `python export.py` to regenerate NHWC-compatible FC weights."
+            "golden_model.py requires metadata format_version=5. "
+            "Run the updated `python export.py` to regenerate blocked weight headers."
         )
     if metadata.get("hardware_feature_layout") != "NHWC":
         raise ValueError("The golden model requires hardware_feature_layout=NHWC.")
@@ -119,6 +119,8 @@ def load_metadata() -> Dict[str, Any]:
 
 def load_fixed_layers(metadata: Dict[str, Any]) -> Dict[str, FixedLayer]:
     """Build Conv1, Conv2, and FC descriptors from metadata and C headers."""
+    if metadata.get("format_version") != 5:
+        raise ValueError("Expected metadata format_version=5; rerun `python export.py`.")
     layer_entries = metadata.get("layers")
     if not isinstance(layer_entries, list):
         raise ValueError("metadata.json does not contain a valid layers list.")
@@ -136,7 +138,13 @@ def load_fixed_layers(metadata: Dict[str, Any]) -> Dict[str, FixedLayer]:
         weight_shape = tuple(int(value) for value in entry["export_weight_shape"])
         original_shape = tuple(int(value) for value in entry["original_weight_shape"])
         output_channels = original_shape[0]
-        weight = parse_c_array(GENERATED_DIR / str(files["weight_header"]), f"{name}_weight", np.dtype(np.int8))
+        weight_path = GENERATED_DIR / str(files["weight_header"])
+        macro = f"{name.upper()}_WEIGHT_LAYOUT_VERSION"
+        version = re.search(rf"^\s*#define\s+{macro}\s+2\s*$",
+                            weight_path.read_text(encoding="utf-8"), re.MULTILINE)
+        if entry.get("weight_header_layout_version") != 2 or version is None:
+            raise ValueError(f"{name}: expected {macro}=2; rerun `python export.py`.")
+        weight = parse_c_array(weight_path, f"{name}_weight", np.dtype(np.int8))
         bias = parse_c_array(GENERATED_DIR / str(files["bias_header"]), f"{name}_bias", np.dtype(np.int32))
         multiplier = parse_c_array(
             GENERATED_DIR / str(files["multiplier_header"]), f"{name}_multiplier", np.dtype(np.int32)
@@ -148,6 +156,24 @@ def load_fixed_layers(metadata: Dict[str, Any]) -> Dict[str, FixedLayer]:
         expected_weight_values = int(np.prod(weight_shape))
         if weight.size != expected_weight_values:
             raise ValueError(f"{name}: header has {weight.size} weights, expected {expected_weight_values}.")
+        # 先解码 header，再沿用原逻辑矩阵计算与 trace 语义。
+        if len(original_shape) == 4:
+            oc, ic, kh, kw = original_shape
+            expected_header_shape = (oc // 4, kh, kw, 4, ic)
+            expected_layout = "[OC/4,KH,KW,4,IC]"
+            if oc % 4 or weight_shape != (kh * kw * ic, oc):
+                raise ValueError(f"{name}: invalid logical Conv weight shape.")
+            permutation = (1, 2, 4, 0, 3)
+        elif name == "fc" and weight_shape == (784, 10):
+            expected_header_shape = (2, 98, 5, 8)
+            expected_layout = "[2,98,5,8]"
+            permutation = (1, 3, 0, 2)
+        else:
+            raise ValueError(f"{name}: unsupported blocked weight shape.")
+        if (tuple(entry.get("header_weight_shape", ())) != expected_header_shape
+                or entry.get("header_weight_layout") != expected_layout):
+            raise ValueError(f"{name}: invalid blocked header metadata; rerun `python export.py`.")
+        weight = weight.reshape(expected_header_shape).transpose(permutation).reshape(weight_shape)
         for array_name, array in (("bias", bias), ("multiplier", multiplier), ("shift", shift)):
             if array.size != output_channels:
                 raise ValueError(f"{name}: {array_name} has {array.size} values, expected {output_channels}.")
