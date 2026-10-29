@@ -1,10 +1,19 @@
 """PyTorch implementation of the canonical YOLOv2-tiny VOC network."""
 
-from typing import Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+
+DEFAULT_VOC_ANCHORS = (
+    (1.08, 1.19),
+    (3.42, 4.41),
+    (6.63, 11.38),
+    (9.42, 5.11),
+    (16.62, 10.52),
+)
 
 
 class ConvBNLeaky(nn.Module):
@@ -62,19 +71,38 @@ class YOLOv2Tiny(nn.Module):
     The convolutional backbone follows the original Darknet YOLOv2-tiny VOC
     configuration. For a 416x416 input and 20 classes, the raw output has
     shape ``[N, 125, 13, 13]`` (5 anchors x (4 box values + objectness + 20
-    class values)). Decoding, loss calculation, and NMS are separate concerns.
+    class values)). ``forward`` returns raw logits; ``decode_predictions`` can
+    convert them to boxes and class scores. Loss calculation and NMS are separate.
     """
 
-    def __init__(self, num_classes: int = 20, num_anchors: int = 5) -> None:
-        """Create the network for the requested class and anchor counts."""
+    def __init__(
+        self,
+        num_classes: int = 20,
+        num_anchors: int = 5,
+        anchors: Optional[Sequence[Sequence[float]]] = None,
+    ) -> None:
+        """Create the detector and store anchor widths/heights in grid-cell units."""
         super().__init__()
         if num_classes <= 0:
             raise ValueError("num_classes must be positive.")
         if num_anchors <= 0:
             raise ValueError("num_anchors must be positive.")
 
+        if anchors is None:
+            if num_anchors != len(DEFAULT_VOC_ANCHORS):
+                raise ValueError("Pass anchors explicitly when num_anchors is not 5.")
+            anchors = DEFAULT_VOC_ANCHORS
+        anchor_tensor = torch.as_tensor(anchors, dtype=torch.float32)
+        if anchor_tensor.shape != (num_anchors, 2):
+            raise ValueError(
+                f"Expected anchors with shape [{num_anchors}, 2], got {tuple(anchor_tensor.shape)}."
+            )
+        if not torch.isfinite(anchor_tensor).all() or (anchor_tensor <= 0).any():
+            raise ValueError("Anchor widths and heights must be finite and positive.")
+
         self.num_classes = num_classes
         self.num_anchors = num_anchors
+        self.register_buffer("anchors", anchor_tensor)
         prediction_channels = num_anchors * (5 + num_classes)
 
         self.conv1 = ConvBNLeaky(3, 16, kernel_size=3)
@@ -150,10 +178,52 @@ class YOLOv2Tiny(nn.Module):
             .contiguous()
         )
 
+    def decode_predictions(
+        self, logits: torch.Tensor, normalized: bool = True
+    ) -> dict[str, torch.Tensor]:
+        """Decode raw logits into center-size boxes and confidence probabilities.
 
-def build_yolov2_tiny(num_classes: int = 20, num_anchors: int = 5) -> YOLOv2Tiny:
+        ``boxes_xywh`` uses center-x, center-y, width, height. By default all
+        coordinates are normalized to the input image; set ``normalized=False``
+        to return grid-cell units. The returned values have shapes
+        ``[N,A,H,W,4]``, ``[N,A,H,W,1]``, and ``[N,A,H,W,C]``. NMS is not applied.
+        """
+        predictions = self.reshape_predictions(logits)
+        anchors, grid_h, grid_w = predictions.shape[1:4]
+        device, dtype = predictions.device, predictions.dtype
+
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(grid_h, device=device, dtype=dtype),
+            torch.arange(grid_w, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        grid_xy = torch.stack((grid_x, grid_y), dim=-1).view(1, 1, grid_h, grid_w, 2)
+        anchor_wh = self.anchors.to(device=device, dtype=dtype).view(1, anchors, 1, 1, 2)
+
+        center_xy = torch.sigmoid(predictions[..., 0:2]) + grid_xy
+        box_wh = torch.exp(predictions[..., 2:4]) * anchor_wh
+        boxes_xywh = torch.cat((center_xy, box_wh), dim=-1)
+        if normalized:
+            grid_scale = boxes_xywh.new_tensor((grid_w, grid_h, grid_w, grid_h))
+            boxes_xywh = boxes_xywh / grid_scale.view(1, 1, 1, 1, 4)
+
+        objectness = torch.sigmoid(predictions[..., 4:5])
+        class_probabilities = torch.softmax(predictions[..., 5:], dim=-1)
+        return {
+            "boxes_xywh": boxes_xywh,
+            "objectness": objectness,
+            "class_probabilities": class_probabilities,
+            "class_scores": objectness * class_probabilities,
+        }
+
+
+def build_yolov2_tiny(
+    num_classes: int = 20,
+    num_anchors: int = 5,
+    anchors: Optional[Sequence[Sequence[float]]] = None,
+) -> YOLOv2Tiny:
     """Construct a YOLOv2-tiny network with the requested detection head size."""
-    return YOLOv2Tiny(num_classes=num_classes, num_anchors=num_anchors)
+    return YOLOv2Tiny(num_classes=num_classes, num_anchors=num_anchors, anchors=anchors)
 
 
 def expected_output_shape(
