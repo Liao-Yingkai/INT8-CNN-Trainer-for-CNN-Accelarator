@@ -103,6 +103,7 @@ output_int8 ≈ (acc_int32 × multiplier) >> shift
     ├── evaluate.py           # FP32 与 QAT 准确率比较
     ├── export.py             # INT8/INT32 参数和 C header 导出
     ├── golden_model.py       # 导出参数的整数黄金验证模型
+    ├── dump_trace.py         # 测试图模块边界数据导出
     ├── observe_weight.py     # 打印 FP32/QAT checkpoint state_dict
     ├── config.yaml           # 训练超参数
     ├── checkpoints/          # 训练 checkpoint（Git 忽略）
@@ -251,12 +252,97 @@ generated/
 │   ├── *_bias.h
 │   ├── *_quant.h
 │   └── *_shift.h
+├── trace/
+│   └── trace_data_*.h
 └── metadata.json
 ```
 
-`.npy` 文件用于 Python 验证；`.h` 文件可直接作为后续 HLS 工程的参数输入；`metadata.json` 记录 shape、layout、scale、zero-point、bias scale、requant 参数和文件路径。
+`.npy` 权重保留用于数学分析的逻辑矩阵；`.h` 权重使用硬件紧凑分块顺序；`metadata.json` 分别记录两者的 shape/layout，以及 scale、zero-point、bias scale、requant 参数和文件路径。Golden 读取的是 `.h`，解码后进行整数计算，不读取权重 NPY。
 
-metadata 当前格式版本为 4。该版本明确区分 PyTorch 的 NCHW 布局与硬件的 NHWC 布局，并用 `C,S → S,C` 描述 FC 输入维度的离线重排，其中 `S = H×W`。
+metadata 当前格式版本为 5。PyTorch 的 NCHW 与硬件 NHWC 布局仍通过 FC 的 `C,S → S,C` 离线重排衔接，其中 `S = H×W`。`export_weight_shape` / `weight_layout` 描述逻辑矩阵；`header_weight_shape` / `header_weight_layout` 描述硬件 header；每层 `weight_header_layout_version=2`。旧 metadata/header 会明确报错，需运行新版 `export.py` 重导出。
+
+### 导出数据说明
+
+`export.py` 生成的数据按“权重、bias、量化参数、C header、元数据”分开保存。数组类型和 shape 如下：
+
+| 路径 | 内容 | 类型 | Conv shape | FC shape |
+| --- | --- | --- | --- | --- |
+| `weights/*_weight_int8.npy` | 经过 FakeQuant scale 量化并完成 layout 转换的 weight | `numpy.int8` | `[K, OC]` | `[K, OC]` |
+| `biases/*_bias_int32.npy` | 按输入 scale 和 weight scale 转换的 bias | `numpy.int32` | `[OC]` | `[OC]` |
+| `quant_params/*_weight_scale.npy` | QAT weight FakeQuant 的 per-channel scale | `numpy.float32` | `[OC]` | `[OC]` |
+| `quant_params/*_weight_zero_point.npy` | weight zero-point | `numpy.int32` | `[OC]` | `[OC]` |
+| `quant_params/*_input_scale.npy` | 当前计算层输入 activation scale | `numpy.float32` | `[1]` | `[1]` |
+| `quant_params/*_output_scale.npy` | 当前计算层输出 activation scale | `numpy.float32` | `[1]` | `[1]` |
+| `quant_params/*_multiplier_int32.npy` | 每个输出通道的 requant multiplier | `numpy.int32` | `[OC]` | `[OC]` |
+| `quant_params/*_shift_int32.npy` | 每个输出通道的 requant shift | `numpy.int32` | `[OC]` | `[OC]` |
+
+其中，`quant_params/` 中的浮点 scale 主要用于 Python 检查和离线分析；FPGA 推理不应读取浮点 scale 来完成 requant，而应使用导出的 `multiplier` 和 `shift`。
+
+`headers/` 的 bias、multiplier 和 shift 与 NPY 顺序相同；权重值相同但顺序不同。权重 header 保留原一维数组名称与元素数，并包含 `CONV1_WEIGHT_LAYOUT_VERSION`、`CONV2_WEIGHT_LAYOUT_VERSION` 或 `FC_WEIGHT_LAYOUT_VERSION` 宏，值均为 2，供消费端拒绝旧格式。
+
+| 权重 header | 紧凑分块 shape | INT8 字节数 |
+| --- | --- | --- |
+| `conv1_weight.h` | `[2,3,3,4,1]` | 72 |
+| `conv2_weight.h` | `[4,3,3,4,8]` | 1152 |
+| `fc_weight.h` | `[2,98,5,8]` | 7840 |
+
+Conv 顺序为 `[OC/4,KH,KW,4,IC实际]`，不为 IC 物理补零。FC 在 NHWC 数学重排后按 `[tile,token,lane,c]` 存储，扁平索引为 `((tile*98+token)*5+lane)*8+c`，对应逻辑矩阵 `weight[token*8+c, tile*5+lane]`。HLS 输入输出结构及事务不变。C 常量仍可直接 include：
+
+```cpp
+const int8_t  conv1_weight[];
+const int32_t conv1_bias[];
+const int32_t conv1_multiplier[];
+const int32_t conv1_shift[];
+```
+
+当前不会生成 scale 的 C header；scale、zero-point 和完整布局信息统一记录在 `metadata.json` 及 `quant_params/` 中。
+
+### `export.py` 的导出逻辑
+
+导出脚本的主要步骤如下：
+
+1. 按 `MnistCnn → fuse_model → create_fpga_qconfig → prepare_qat → load_state_dict` 恢复 QAT 模型。QAT checkpoint 不能直接作为普通 FP32 模型读取。
+2. 从每个计算层的 `weight_fake_quant.calculate_qparams()` 读取 per-channel `weight_scale` 和 `weight_zero_point`。
+3. 对 FP32 `module.weight` 按输出通道执行：
+
+   ```text
+   weight_int8[channel] = round(weight_fp32[channel] / weight_scale[channel])
+   ```
+
+   结果夹紧到 `[-128,127]` 后保存为 INT8。由于配置为 symmetric，weight zero-point 应为 0。
+4. 转换 weight layout：
+
+   - Conv：`[OC,IC,KH,KW] → [KH,KW,IC,OC] → [KH×KW×IC,OC]`；
+   - FC：原始 PyTorch FC 输入顺序是 `[C,S]`，其中 `S=H×W`；硬件 NHWC flatten 顺序是 `[S,C]`，因此执行 `[OC,C,S] → [S,C,OC] → [S×C,OC]`。
+
+   FC 的通道数 C 从最后一个 Conv 的 `out_channels` 自动获取，空间元素数由 `fc.in_features / C` 得到，不需要单独推断 H 和 W。
+   上述 `[K,OC]` 保存为 NPY 逻辑矩阵；另按前述分块格式生成硬件权重 header，不改变计算、量化和 trace 的数学语义。
+5. 从 activation FakeQuant 读取 per-tensor activation scale。第一层使用模型输入 scale，后续层使用前一层输出 scale；activation zero-point 为 0。
+6. 按输出通道把 bias 转换为 INT32：
+
+   ```text
+   bias_int32[channel] = round(
+       bias_fp32[channel] /
+       (input_scale × weight_scale[channel])
+   )
+   ```
+
+7. 计算每个输出通道的真实 requant 比例，并编码为整数 multiplier/shift：
+
+   ```text
+   real_multiplier[channel]
+       = input_scale × weight_scale[channel] / output_scale
+
+   real_multiplier ≈ multiplier[channel] / 2^shift[channel]
+   ```
+
+   HLS 侧可使用等价的整数形式：
+
+   ```text
+   output_int8 ≈ (acc_int32 × multiplier) >> shift
+   ```
+
+8. 将 NPY、C header 和 `metadata.json` 写入 `generated/`，并在终端打印每层原始 weight shape、导出 shape、scale 数量和 bias 数量。
 
 ### 5. 黄金模型验证
 
@@ -274,7 +360,76 @@ python golden_model.py
 
 当前脚本固定验证 1000 个 MNIST 测试样本，不需要命令行参数。运行前必须已生成 `qat_model.pth` 和 `generated/metadata.json`/headers。
 
-### 6. 查看 checkpoint 内容（可选）
+### 6. 批量导出测试图模块边界数据
+
+```bash
+python dump_trace.py
+```
+
+脚本会从 MNIST 测试集中随机选择图片；如果本地没有测试集，会自动下载到 `CNN_FPGA/data/`。脚本使用与训练相同的 `ToTensor()` 和 Normalize，并调用 `golden_model.py` 中已有的定点推理逻辑，不重新实现卷积。
+
+通过 `--num-samples` 指定导出的图片数量，默认导出 1 张。样本从测试集不重复抽取，因此数量不能超过 MNIST 测试集大小（10000）：
+
+```bash
+python dump_trace.py --num-samples 10
+```
+
+默认使用 `seed=1`。如需选择其他可复现的图片序列，可以指定随机种子：
+
+```bash
+python dump_trace.py --num-samples 10 --seed 123
+```
+
+运行时会打印每个样本在 MNIST 测试集中的 index 和 label。
+
+每个样本单独生成一个 header，文件名按导出顺序使用四位零填充后缀：
+
+```text
+generated/trace/trace_data_0000.h
+generated/trace/trace_data_0001.h
+...
+generated/trace/trace_data_0009.h
+```
+
+每次运行前会清理 `generated/trace/` 下由该脚本生成的旧 trace header，避免上一次数量较多时残留文件造成混淆。
+
+每个 header 都可以直接被 HLS CSim include，并包含同样命名的模块边界数组；一次 CSim 运行选择一个对应样本的 header 即可。header 注释中记录了导出序号、MNIST 测试集 index 和 label。每个文件包含：
+
+| 数组 | 类型 | shape | 语义 |
+| --- | --- | --- | --- |
+| `trace_input_int8_hwc` | `int8_t` | `[28,28,1]` | 量化后的输入 |
+| `trace_conv1_unfold_int8` | `int8_t` | `[784,9]` | Conv1 的 im2row/unfold 输出 |
+| `trace_conv1_systolic_int32_nhwc` | `int32_t` | `[28,28,8]` | Conv1 MAC，未加 bias |
+| `trace_conv1_postprocess_int32_nhwc` | `int32_t` | `[28,28,8]` | Conv1 加 bias、ReLU 后 |
+| `trace_conv1_requant_int8_nhwc` | `int8_t` | `[28,28,8]` | Conv1 requant 后 |
+| `trace_pool1_int8_nhwc` | `int8_t` | `[14,14,8]` | MaxPool1 后 |
+| `trace_conv2_unfold_int8` | `int8_t` | `[196,72]` | Conv2 的 im2row/unfold 输出 |
+| `trace_conv2_systolic_int32_nhwc` | `int32_t` | `[14,14,16]` | Conv2 MAC，未加 bias |
+| `trace_conv2_postprocess_int32_nhwc` | `int32_t` | `[14,14,16]` | Conv2 加 bias、ReLU 后 |
+| `trace_conv2_requant_int8_nhwc` | `int8_t` | `[14,14,16]` | Conv2 requant 后 |
+| `trace_pool2_int8_nhwc` | `int8_t` | `[7,7,16]` | MaxPool2 后 |
+| `trace_fc_systolic_int32` | `int32_t` | `[10]` | FC MAC，未加 bias |
+| `trace_fc_postprocess_int32` | `int32_t` | `[10]` | FC 加 bias 后 |
+| `trace_fc_requant_int8` | `int8_t` | `[10]` | FC requant 后 |
+
+Conv 的 postprocess 输出包含 ReLU。当前模型 FC 后没有 ReLU，因此 FC postprocess 只包含 bias 加法。systolic 和 postprocess 阶段本质上是 INT32，requant 和池化输出是 INT8；脚本会在写出前检查每个数组的 dtype 和取值范围。
+
+两个 `unfold` 数组是卷积 systolic 输入的直接参考数据，采用 `[OH×OW, KH×KW×Cin]` 排布。每一行对应一个输出像素，列顺序为 `[KH, KW, Cin]`，与解码后的逻辑卷积矩阵 `[KH, KW, Cin, Cout] → [K, Cout]` 相匹配（不是 header 的物理顺序）；padding=1 的边界位置使用量化零值填充。
+
+HLS CSim 中可直接使用：
+
+```cpp
+#include "trace_data_0000.h"
+
+// 例如比较 Conv1 requant 输出
+if (conv1_output[y][x][c] != trace_conv1_requant_int8_nhwc[(y * 28 + x) * 8 + c]) {
+    // report mismatch
+}
+```
+
+该 trace 文件不包含额外 JSON metadata、scale 或浮点数据；shape 通过 C 数组声明和 header 注释给出，量化参数继续使用 `generated/headers/` 中的导出参数。
+
+### 7. 查看 checkpoint 内容（可选）
 
 ```bash
 python observe_weight.py
@@ -290,7 +445,7 @@ PyTorch Conv2d 权重布局为：
 [OC, IC, KH, KW]
 ```
 
-为了适配后续 HLS 矩阵乘法接口，导出时转换为：
+数学分析及 NPY 使用以下逻辑矩阵转换（硬件 header 在此基础上再分块）：
 
 ```text
 [OC, IC, KH, KW]
@@ -301,11 +456,11 @@ PyTorch Conv2d 权重布局为：
 
 各层导出 shape：
 
-| 层 | PyTorch shape | HLS shape |
-| --- | --- | --- |
-| Conv1 | `[8, 1, 3, 3]` | `[9, 8]` |
-| Conv2 | `[16, 8, 3, 3]` | `[72, 16]` |
-| FC | `[10, 784]` | `[784, 10]` |
+| 层 | PyTorch shape | NPY / 逻辑矩阵 shape | 硬件 header shape |
+| --- | --- | --- | --- |
+| Conv1 | `[8, 1, 3, 3]` | `[9, 8]` | `[2,3,3,4,1]` |
+| Conv2 | `[16, 8, 3, 3]` | `[72, 16]` | `[4,3,3,4,8]` |
+| FC | `[10, 784]` | `[784, 10]` | `[2,98,5,8]` |
 
 Conv 的 K 维顺序对应 `[KH, KW, IC]`。后续硬件侧生成卷积窗口时必须采用相同的展平顺序。
 
@@ -342,7 +497,7 @@ S = fc.in_features / C
 
 导出时只需检查 `fc.in_features` 能否被 C 整除，不需要推导独立的 H、W，也不要求 feature map 为方形。
 
-因此硬件可将 `[N, 7, 7, 16]` 的 NHWC 输出直接按 HWC 顺序 flatten 后送入 FC，无需转回 NCHW。FC 导出前后的矩阵 shape 仍是 `[784, 10]`，但 K 维内部的数据顺序已经改变。
+因此硬件可将 `[N, 7, 7, 16]` 的 NHWC 输出直接按 HWC 顺序 flatten 后送入 FC，无需转回 NCHW。FC 用于数学计算的逻辑矩阵为 `[784, 10]`，K 维已从 CHW 重排为 HWC；硬件 header 进一步分块为 `[2,98,5,8]`。
 
 ## 常见问题
 
