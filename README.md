@@ -20,6 +20,8 @@ Golden integer model validation
 
 本仓库只包含 PyTorch 训练、量化、导出和软件验证逻辑，不包含 HLS 内核、片上缓存、systolic array、AXI 接口或 FPGA 工程。
 
+MNIST 项目已完成收尾。YOLOv2-tiny 的 VOC 适配从独立目录 [`YOLOV2_TINY/`](YOLOV2_TINY/README.md) 开始，目前先实现网络定义；VOC 数据管线、训练、评估、QAT 和参数导出将在后续阶段加入，避免影响现有 MNIST 工程。
+
 ## 模型结构
 
 PyTorch 训练模型使用标准 NCHW 格式，输入 shape 为 `[N, 1, 28, 28]`。导出后的硬件 feature map 使用 NHWC 格式，使卷积矩阵 K 维中的输入通道连续排列。

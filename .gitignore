@@ -18,9 +18,16 @@ CNN_FPGA/checkpoints/*
 *.pt
 *.ckpt
 
+# Downloaded VOC data and YOLO training checkpoints
+YOLOV2_TINY/data/
+YOLOV2_TINY/checkpoints/*
+!YOLOV2_TINY/checkpoints/.gitkeep
+
 # Generated FPGA parameter exports (NPY/JSON/BIN/headers belong here)
 CNN_FPGA/generated/*
 !CNN_FPGA/generated/.gitkeep
+YOLOV2_TINY/generated/*
+!YOLOV2_TINY/generated/.gitkeep
 
 # Common FPGA/HLS build products; future source headers remain tracked
 .Xil/
