@@ -3,12 +3,17 @@ import argparse
 from pathlib import Path
 import torch
 from torchvision.ops import batched_nms, box_iou
+from torch.ao.quantization.fake_quantize import FakeQuantizeBase
 
 
 @torch.no_grad()
 def evaluate(model, loader, device, score_threshold=.01):
     """Accumulate detections and evaluate each class with difficult-object handling."""
     model.eval()
+    observer_states = [(module, module.observer_enabled.clone()) for module in model.modules()
+                       if isinstance(module, FakeQuantizeBase)]
+    for module, _ in observer_states:
+        module.disable_observer()
     records = {c: [] for c in range(model.num_classes)}
     ground_truth = {}
     image_id = 0
@@ -49,6 +54,8 @@ def evaluate(model, loader, device, score_threshold=.01):
         ap = sum(float(precision[recall >= threshold].max()) if (recall >= threshold).any() else 0.
                  for threshold in torch.linspace(0,1,11)) / 11
         aps.append(ap)
+    for module, enabled in observer_states:
+        module.observer_enabled.copy_(enabled)
     return sum(aps)/len(aps), aps
 
 
@@ -56,22 +63,30 @@ def main():
     """Evaluate a saved floating-point checkpoint on configured evaluation split."""
     from train import load_config, make_loader, build_model
     parser = argparse.ArgumentParser()
-    parser.add_argument('--checkpoint', default='checkpoints/float_model_best.pth')
+    parser.add_argument('--mode', choices=['float', 'qat', 'both'], default='both')
     args = parser.parse_args()
     config = load_config()
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    path = Path(args.checkpoint)
-    if not path.is_absolute():
-        path = Path(__file__).parent / path
-    state = torch.load(path, map_location=device, weights_only=False)
-    if 'config' in state:
+    from quant import load_qat_model
+    scores = {}
+    modes = ['float', 'qat'] if args.mode == 'both' else [args.mode]
+    for mode in modes:
+        path = Path(__file__).parent / f'checkpoints/{mode}_model.pth'
+        state = torch.load(path, map_location='cpu', weights_only=False)
         config['model'] = state['config']['model']
-    model = build_model(config).to(device)
-    model.load_state_dict(state['model_state_dict'])
-    score, aps = evaluate(model, make_loader(config, 'evaluation', False), device)
-    for name, ap in zip(config['model']['classes'], aps):
-        print(f'{name}: AP50={ap:.4f}')
-    print(f'VOC2007 mAP50={score:.4f}')
+        if mode == 'qat':
+            model = load_qat_model(path, device)
+        else:
+            model = build_model(config).to(device)
+            model.load_state_dict(state['model_state_dict'])
+        score, aps = evaluate(model, make_loader(config, 'evaluation', False), device)
+        scores[mode] = score
+        for name, ap in zip(config['model']['classes'], aps):
+            print(f'{mode} {name}: AP50={ap:.4f}')
+        print(f'{mode} VOC2007 mAP50={score:.4f}')
+        del model
+    if len(scores) == 2:
+        print(f'QAT - FP32 mAP50={scores["qat"]-scores["float"]:+.4f}')
 
 
 if __name__ == '__main__':

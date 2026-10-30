@@ -6,9 +6,10 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 from dataset import VOCDataset, collate
-from model import YOLOv2Tiny
 from loss import YOLOLoss
 from evaluate import evaluate
+from quant import build_model, prepare_qat_model, save_checkpoint
+from torch.ao.quantization import disable_observer
 
 ROOT = Path(__file__).resolve().parent
 
@@ -24,12 +25,6 @@ def load_config():
     return config
 
 
-def build_model(config):
-    """Construct the detector using the configured anchors."""
-    settings = config['model']
-    return YOLOv2Tiny(settings['num_classes'], settings['num_anchors'], settings['anchors'])
-
-
 def make_loader(config, split, augment):
     """Build a VOC loader with variable-length detection targets."""
     settings = config['model']
@@ -43,35 +38,23 @@ def make_loader(config, split, augment):
                       pin_memory=torch.cuda.is_available())
 
 
-def main():
-    """Train FP32 weights, validate mAP and save resumable last/best checkpoints."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', choices=['float'], default='float')
-    parser.add_argument('--resume', type=Path)
-    args = parser.parse_args()
-    config = load_config()
+def train_model(model, training, validation, device, config, mode):
+    """Train FP32 or fine-tune QAT and save final/best weights like MNIST."""
     settings = config['training']
-    random.seed(settings['seed']); torch.manual_seed(settings['seed'])
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    print(f'Using {device}')
-    model = build_model(config).to(device)
-    optimizer = torch.optim.SGD(model.parameters(), lr=settings['learning_rate'],
+    epochs = settings['float_epochs'] if mode == 'float' else settings['qat_epochs']
+    lr = settings['float_learning_rate'] if mode == 'float' else settings['qat_learning_rate']
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr,
                                 momentum=.9, weight_decay=.0005)
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, settings['milestones'], gamma=.1)
-    start, best = 0, -1.
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start, best = checkpoint['epoch'], checkpoint['best_map']
-    training = make_loader(config, 'train', True)
-    validation = make_loader(config, 'validation', False)
+    milestones = settings['float_milestones'] if mode == 'float' else settings['qat_milestones']
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=.1)
+    best = -1.
     criterion = YOLOLoss()
     output = ROOT / 'checkpoints'
     output.mkdir(exist_ok=True)
-    for epoch in range(start, settings['epochs']):
+    for epoch in range(epochs):
         model.train()
+        if mode == 'qat' and epoch >= settings['qat_observer_freeze_epoch']:
+            model.apply(disable_observer)
         total, count = 0., 0
         for images, targets in training:
             optimizer.zero_grad(set_to_none=True)
@@ -86,13 +69,40 @@ def main():
         score, _ = evaluate(model, validation, device)
         improved = score > best
         best = max(best, score)
-        state = dict(model_state_dict=model.state_dict(), optimizer_state_dict=optimizer.state_dict(),
-                     scheduler_state_dict=scheduler.state_dict(), epoch=epoch+1, best_map=best,
-                     map50=score, config=config)
-        torch.save(state, output / 'float_model.pth')
+        save_checkpoint(output / f'{mode}_model.pth', model, epoch+1, score, config)
         if improved:
-            torch.save(state, output / 'float_model_best.pth')
-        print(f'epoch={epoch+1}/{settings["epochs"]} loss={total/max(count,1):.5f} mAP50={score:.4f}')
+            save_checkpoint(output / f'{mode}_model_best.pth', model, epoch+1, score, config)
+        print(f'epoch={epoch+1}/{epochs} loss={total/max(count,1):.5f} mAP50={score:.4f}')
+    return best
+
+
+def main():
+    """Run FP32 training or lower-learning-rate QAT initialized from FP32."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', choices=['float', 'qat'], required=True)
+    args = parser.parse_args()
+    config = load_config()
+    random.seed(config['training']['seed']); torch.manual_seed(config['training']['seed'])
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print(f'Using {device}')
+    float_path = ROOT / 'checkpoints/float_model.pth'
+    if args.mode == 'qat':
+        state = torch.load(float_path, map_location='cpu', weights_only=False)
+        config['model'] = state['config']['model']
+        model = build_model(config).to(device)
+        model.load_state_dict(state['model_state_dict'])
+    else:
+        model = build_model(config).to(device)
+    training = make_loader(config, 'train', True)
+    validation = make_loader(config, 'validation', False)
+    if args.mode == 'float':
+        train_model(model, training, validation, device, config, 'float')
+        return
+    fp32_map, _ = evaluate(model, validation, device)
+    del model
+    qat = prepare_qat_model(float_path, device)
+    qat_map = train_model(qat, training, validation, device, config, 'qat')
+    print(f'FP32 mAP50={fp32_map:.4f} | best QAT mAP50={qat_map:.4f} | delta={qat_map-fp32_map:+.4f}')
 
 
 if __name__ == '__main__':

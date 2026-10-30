@@ -5,6 +5,7 @@ from typing import Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.ao.quantization import QuantStub, DeQuantStub, fuse_modules
 
 
 DEFAULT_VOC_ANCHORS = (
@@ -103,6 +104,8 @@ class YOLOv2Tiny(nn.Module):
         self.num_classes = num_classes
         self.num_anchors = num_anchors
         self.register_buffer("anchors", anchor_tensor)
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
         prediction_channels = num_anchors * (5 + num_classes)
 
         self.conv1 = ConvBNLeaky(3, 16, kernel_size=3)
@@ -152,6 +155,7 @@ class YOLOv2Tiny(nn.Module):
         if x.shape[2] % 32 != 0 or x.shape[3] % 32 != 0:
             raise ValueError("Input height and width must both be divisible by 32.")
 
+        x = self.quant(x)
         x = self.pool1(self.conv1(x))
         x = self.pool2(self.conv2(x))
         x = self.pool3(self.conv3(x))
@@ -160,7 +164,13 @@ class YOLOv2Tiny(nn.Module):
         x = self.pool6(self.conv6(x))
         x = self.conv7(x)
         x = self.conv8(x)
-        return self.prediction(x)
+        return self.dequant(self.prediction(x))
+
+    def fuse_model(self) -> None:
+        """Fold eval-mode BN into Conv before QAT; preserve LeakyReLU separately."""
+        for index in range(1, 9):
+            block = getattr(self, f'conv{index}')
+            fuse_modules(block, [['conv', 'bn']], inplace=True)
 
     def reshape_predictions(self, logits: torch.Tensor) -> torch.Tensor:
         """View NCHW logits as ``[N, anchors, grid_h, grid_w, 5+classes]``."""

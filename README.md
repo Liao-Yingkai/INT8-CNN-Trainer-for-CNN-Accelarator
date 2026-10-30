@@ -20,7 +20,7 @@ Golden integer model validation
 
 本仓库只包含 PyTorch 训练、量化、导出和软件验证逻辑，不包含 HLS 内核、片上缓存、systolic array、AXI 接口或 FPGA 工程。
 
-MNIST 项目已完成收尾。独立目录 [`YOLOV2_TINY/`](YOLOV2_TINY/README.md) 提供 YOLOv2-tiny 的 VOC 浮点网络、数据加载、损失函数、训练和 mAP 评估；QAT 和参数导出将在后续阶段加入。
+MNIST 项目已完成收尾。独立目录 [`YOLOV2_TINY/`](YOLOV2_TINY/README.md) 提供 YOLOv2-tiny 的 VOC 浮点训练、QAT 微调和 mAP 评估，脚本职责与 checkpoint 命名保持一致；参数导出将在后续阶段加入。
 
 ## 模型结构
 

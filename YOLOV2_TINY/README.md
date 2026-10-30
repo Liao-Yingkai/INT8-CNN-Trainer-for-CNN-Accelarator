@@ -1,6 +1,6 @@
 # YOLOv2-tiny VOC PyTorch 工程
 
-当前已提供浮点网络、VOC 数据加载、检测损失、训练和 VOC2007 mAP50 评估。QAT 和 FPGA 参数导出在后续阶段接入。
+当前提供 FP32 训练、官方 eager-mode QAT 微调和 VOC2007 mAP50 评估。脚本职责、训练模式和 checkpoint 命名与 `CNN_FPGA/` 保持一致；参数导出后续接入。
 
 ## 网络规格
 
@@ -60,11 +60,19 @@ YOLOV2_TINY/data/VOCdevkit/
 
 ```bash
 python train.py --mode float
-python train.py --resume checkpoints/float_model.pth
-python evaluate.py --checkpoint checkpoints/float_model_best.pth
+python train.py --mode qat
+python evaluate.py
 ```
 
-CUDA 可用时默认使用 `cuda:0`，否则使用 CPU。训练打印每个 epoch 的 loss、验证 mAP50，保存最后一轮 `checkpoints/float_model.pth` 和最佳 `float_model_best.pth`。checkpoint 包含 optimizer、scheduler、epoch 和配置，可恢复训练。当前从随机初始化开始训练。
+CUDA 可用时默认使用 `cuda:0`，否则使用 CPU。FP32 从随机初始化训练；QAT 加载最后一轮 `checkpoints/float_model.pth`，使用更低学习率继续微调。训练打印 epoch、loss 和验证 mAP50。两种模式分别保存 `float_model.pth` / `qat_model.pth`，以及对应的 `*_best.pth`。checkpoint 保存模型、epoch、mAP 和构造配置；不提供 `--resume`。
+
+`config.yaml` 的 `training` 使用 `float_epochs`、`float_learning_rate`、`qat_epochs`、`qat_learning_rate` 等字段，与 MNIST 的含义一致。默认 QAT 20 个 epoch、学习率 0.0001；从零开始计数的 epoch 15 起冻结 Observer。
+
+`quant.py` 提供 `create_fpga_qconfig()`、`prepare_qat_model()`、`load_qat_model()` 和 `save_checkpoint()`，与 MNIST 的接口职责相同。采用官方 FakeQuant：activation 为 per-tensor symmetric signed INT8，weight 为 axis=0 的 per-channel symmetric signed INT8，zero_point 均为 0。
+
+YOLO 先在 eval 状态把预训练 BN 折叠进 Conv，再执行 `prepare_qat()`；因此 FP32 checkpoint 无需预先融合，QAT 阶段不再更新 BN。LeakyReLU 保持独立并具有自己的 activation FakeQuant，Conv 输出（激活前）也有独立 FakeQuant；池化不添加额外 Observer。解码与 NMS 使用浮点运算。当前 QAT 仍是 FakeQuant 模拟，尚未生成硬件 INT8 权重/INT32 bias。
+
+`evaluate.py` 默认在同一测试集分别评估最后一轮 FP32/QAT checkpoint，并打印 mAP 差值；只评估一种模式可使用 `python evaluate.py --mode float` 或 `--mode qat`。评估时关闭 QAT Observer 并保留 FakeQuant，避免测试数据更新 scale。旧 FP32 checkpoint 的 `model_state_dict` 和 `config.model` 可以直接用于 QAT；当前正在运行的 FP32 训练无需重启。
 
 `dataset.py` 将图像等比例 letterbox 到配置尺寸，框坐标同步缩放和平移，RGB 像素缩放到 `[0,1]`；训练增加随机水平翻转、亮度和颜色增强。标签内部使用归一化 `xyxy + class_id`，保留 difficult 标记。
 
