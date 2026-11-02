@@ -85,7 +85,7 @@ def main():
     random.seed(config['training']['seed']); torch.manual_seed(config['training']['seed'])
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print(f'Using {device}')
-    float_path = ROOT / 'checkpoints/float_model.pth'
+    float_path = ROOT / 'checkpoints/official_voc_fp32.pth'
     if args.mode == 'qat':
         state = torch.load(float_path, map_location='cpu', weights_only=False)
         config['model'] = state['config']['model']
