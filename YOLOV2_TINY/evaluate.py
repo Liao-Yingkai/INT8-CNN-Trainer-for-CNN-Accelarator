@@ -64,6 +64,10 @@ def main():
     from train import load_config, make_loader, build_model
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['float', 'qat', 'both'], default='both')
+    parser.add_argument('--float-checkpoint', type=Path,
+                        default=Path(__file__).parent/'checkpoints/float_model.pth')
+    parser.add_argument('--qat-checkpoint', type=Path,
+                        default=Path(__file__).parent/'checkpoints/qat_model.pth')
     args = parser.parse_args()
     config = load_config()
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -71,7 +75,9 @@ def main():
     scores = {}
     modes = ['float', 'qat'] if args.mode == 'both' else [args.mode]
     for mode in modes:
-        path = Path(__file__).parent / f'checkpoints/{mode}_model.pth'
+        # 可显式选择 QAT 的同源 FP32 和最佳 QAT；保留原有默认入口及命名。
+        path = args.float_checkpoint if mode == 'float' else args.qat_checkpoint
+        print(f'{mode} checkpoint={path} | evaluation split={config["data"]["evaluation"]}')
         state = torch.load(path, map_location='cpu', weights_only=False)
         config['model'] = state['config']['model']
         if mode == 'qat':
