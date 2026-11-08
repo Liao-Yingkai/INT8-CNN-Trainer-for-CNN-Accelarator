@@ -285,4 +285,125 @@ git diff --check
 
 测试只在临时目录创建随机合成 FP32/QAT checkpoint、随机输入校准和导出文件，覆盖 416 forward 的 19 个 FQ、FP32 初始化、严格恢复及旧结构拒绝、九层 Shape/BIN 全量回读、负补码、G=1/2/128、Cin/Cout 补零、little-endian field-first 参数、整数正负分支/截断/饱和及错误参数拒绝。随机校准不是训练，测试通过不代表检测精度达标。
 
-当前已有通过新方案结构核查的本地 QAT checkpoint；旧结构的 mAP 不能作为新结构结果。本次文件整理未运行训练、VOC 全量 mAP、完整 YOLO 整数 Golden 推理、HLS/Vivado/Vitis 仿真或硬件验证，不能仅凭结构和 BIN 测试声称其精度或硬件效果已验证。
+当前已有通过新方案结构核查的本地 QAT checkpoint；旧结构的 mAP 不能作为新结构结果。结构和参数 BIN 测试不代表模型精度或硬件效果已验证；逐层整数 trace 功能见下文。
+
+## 导出 FPGA 模块边界 Trace
+
+`dump_trace.py` 与 MNIST 的用途相同：从测试集选图，输出用于 Im2Row、Systolic、PostProcess、Pool 的功能比较数据。但 YOLO **只导出 BIN**，不生成 `.h`、NPY 或新的 JSON。它直接读取现有 `metadata.json` 和 `bins/` 的权重、bias、M/S，不读取参数 NPY、不恢复 FP32/QAT checkpoint，也不会改变 Observer、scale 或参数文件。
+
+在 `YOLOV2_TINY/` 中运行：
+
+```bash
+# 先准备与所选 checkpoint 对应的参数；已有最新参数时不必重复运行。
+python export.py --checkpoint checkpoints/qat_model_best.pth
+
+# 默认从本地 VOC2007 test 无放回抽取 1 张，seed=1。
+python dump_trace.py
+
+# 抽取 3 张，文件按导出顺序添加 _0000、_0001、_0002 后缀。
+# 重复运行请使用不同的 trace 输出目录，避免覆盖已有文件。
+python dump_trace.py --num-samples 3 --seed 1 --output-dir generated/trace_batch3
+
+# 验证另一个独立参数目录；默认 trace 路径跟随 generated-dir。
+python dump_trace.py --generated-dir /path/to/export --output-dir /path/to/trace
+```
+
+`-n`、`--num-samples`、`--num-images` 等价，默认数量 1；`--seed` 默认 1。数据路径沿用 `config.yaml` 的 `data.root`，固定使用 VOC2007 test、416×416、无增强，不下载数据。RGB/letterbox/像素 `[0,1]` 预处理复用 `dataset.py`，随后使用导出的输入 scale、FP32 reciprocal、最近偶数舍入和 `[-128,127]` 饱和得到输入 INT8；不使用 MNIST mean/std。
+
+后缀表示导出顺序，不是数据集索引；程序在终端打印 seed、抽样索引及 VOC 图像 ID，没有额外标签/metadata 文件。相同数量和 seed 重现同一顺序。样本数必须在 1～4952 内；指定多个样本时不重复抽取。需要保留索引记录时可自行保存终端日志。
+
+### 文件分类和模块边界
+
+所有 trace BIN 平铺在 `generated/trace/`；参数仍在 `generated/bins/`，不混入 trace。每张图片固定 **43 个文件**：输入 1 个、9 个卷积阶段各 4 个、Pool1～Pool6 各 1 个。层名为 `conv1`～`conv8`、`prediction`。
+
+```text
+generated/trace/
+├── trace_input_int8_hwc_0000.bin
+├── trace_conv1_unfold_int8_0000.bin
+├── trace_conv1_im2row_int8_0000.bin
+├── trace_conv1_systolic_int32_hwc_0000.bin
+├── trace_conv1_postprocess_int8_hwc_0000.bin
+├── trace_pool1_int8_hwc_0000.bin
+├── ...conv2～conv8（Pool 仅到 pool6）
+├── trace_prediction_unfold_int8_0000.bin
+├── trace_prediction_im2row_int8_0000.bin
+├── trace_prediction_systolic_int32_hwc_0000.bin
+└── trace_prediction_postprocess_int8_hwc_0000.bin
+```
+
+| 文件内容 | 类型 | shape / 含义 |
+|---|---|---|
+| input | INT8 | `[416,416,3]`，逻辑 HWC |
+| unfold | INT8 | `[H*W,Kh*Kw*Cin]`，逻辑输入 patch 矩阵 |
+| im2row | INT8 | `[H,T,R,4,8]`，硬件 Activation Pack |
+| systolic | INT32 | `[H,W,Cout]`，完整 Cin 归约后的 MAC，不含 bias |
+| postprocess | INT8 | `[H,W,Cout]`，bias + LeakyReLU 分支 + requant + 饱和的最终结果 |
+| pool | INT8 | `[Hout,Wout,Cout]`，Pool 的最终结果 |
+
+**bias、LeakyReLU、requant 都属于一次性 PostProcess，不单独导出 bias_add、INT32 激活结果或独立 requant 文件。** Prediction 只做 bias 和 requant，不启用 LeakyReLU，也不执行检测解码、NMS、ReLU 或 Softmax；最后一个文件是 125 通道的量化 raw logits。
+
+### 完整尺寸表
+
+这里 H/W 指卷积输出空间尺寸（这些卷积 stride=1，等于本层输入尺寸），不是后续 Pool 的尺寸。`G=ceil(Cin/8)`、`T=ceil(W/4)`、`R=Kh*Kw*G`。
+
+| 阶段 | H=W | Cin → Cout | unfold shape | im2row shape | 后续 Pool H=W |
+|---|---:|---|---|---|---:|
+| conv1 | 416 | 3 → 16 | [173056,27] | [416,104,9,4,8] | 208 |
+| conv2 | 208 | 16 → 32 | [43264,144] | [208,52,18,4,8] | 104 |
+| conv3 | 104 | 32 → 64 | [10816,288] | [104,26,36,4,8] | 52 |
+| conv4 | 52 | 64 → 128 | [2704,576] | [52,13,72,4,8] | 26 |
+| conv5 | 26 | 128 → 256 | [676,1152] | [26,7,144,4,8] | 13 |
+| conv6 | 13 | 256 → 512 | [169,2304] | [13,4,288,4,8] | 13 |
+| conv7 | 13 | 512 → 1024 | [169,4608] | [13,4,576,4,8] | 无 |
+| conv8 | 13 | 1024 → 1024 | [169,9216] | [13,4,1152,4,8] | 无 |
+| prediction | 13 | 1024 → 125 | [169,1024] | [13,4,128,4,8] | 无 |
+
+### 数据顺序、补零和字节偏移
+
+所有文件无文件头，采用 C 连续顺序；INT8 为原始 signed 补码字节，INT32 明确为 little-endian `<i4`。程序打印每个文件的 shape、dtype 和实际字节数，不序列化 C++ 结构体、Valid 字段或对齐填充。
+
+- **HWC：**元素索引 `((y*W+x)*C+c)`；INT8 字节偏移等于元素索引，Systolic INT32 字节偏移再乘 4。HWC 文件只包含真实空间位置和逻辑 Cout，不补 Prediction 的 3 个无效 Cout。
+- **unfold：**行号为 `y*W+x`，列号为 `((kh*Kw+kw)*Cin+ic)`；与逻辑权重 `[Kh*Kw*Cin,Cout]` 的 K 顺序一致，没有 Cin Group 补齐。
+- **im2row：**轴顺序为 `y→tile_x→kh→kw→cin_group→spatial_lane→channel_lane`，其中 `token=(kh*Kw+kw)*G+group`。每个 Pack 的 4 个 Lane 是同一行的 4 个空间位置，每个空间 Lane 内为 8 个连续通道，不是 4 行图像。
+
+```text
+im2row byte_offset = 32*((y*T+tile_x)*R+token) + 8*spatial_lane + channel_lane
+output_x = tile_x*4 + spatial_lane
+source_y = y + kh - padding
+source_x = output_x + kw - padding
+source_c = group*8 + channel_lane
+```
+
+3×3 的 padding=1，1×1 的 padding=0。空间输出位置不存在、源坐标处于卷积 Padding 或 Cin 通道无效时，im2row 数据为 0。每个 kernel 位置独立补齐 Cin，不能跨 kernel 拼接剩余通道；空间 Tile 不跨图像行。W=13 的每行最后一个 Tile 仅 spatial Lane0 有效；W=26 的末 Tile 仅前两个 Lane 有效。
+
+im2row 每个空间 Tile 只导出一次，Pack 数为 `H*T*R`、文件字节数为 `H*T*R*32`；不为每个 Cout Tile 或缓存块重复写入相同的激活数据。先写入文件的字节对应 Pack 较低 bit；每个空间 Lane 的 8 个 Cin 可按 little-endian 64-bit word 读取。
+
+### 数值参考与 HLS 对比方式
+
+权重从物理 BIN 解包为逻辑矩阵；用标准 PyTorch unfold 重排 patch，通过矩阵乘法求 MAC，不模拟 PE、错拍、Replay、FIFO 或逐周期时序。为避免通用 INT64 GEMM 的速度问题，CPU 上用 float64 GEMM 求和：INT8 操作数的所有乘积和任意部分和都有 `K*128*128` 的绝对界，本网络最大 K=9216，远小于 `2^53`，因此可精确表示整数结果。输出仍须通过整数性和 INT32 范围检查；测试用独立 INT64 MAC 做逐元素核对，不使用 float32/TF32 近似 MAC。
+
+PostProcess 直接复用 `export.py` 的 `integer_postprocess()`：检查 `accumulator+bias` 能装入 INT32，按固定 alpha 派生负系数，INT64 乘法后算术右移，不加 rounding offset，最终饱和为 INT8。Pool1～Pool5 为 2×2/stride2、无补边；Pool6 为 2×2/stride1，仅右侧和下侧补 -128。后续层始终消费前一层的整数参考结果，不用 QAT 输出替换中间结果。
+
+HLS TB 比较方法：
+
+1. Im2Row 输入由当前层逻辑 HWC Feature 按 `y→x→group→lane` 组装 8 通道 Pack；Cin 尾部填零，不将卷积空间 Padding 作为输入像素。
+2. Im2Row 输出按顺序读取 `im2row` BIN，每个事务比较 32 字节。spatial_valid 由 `tile_x*4+s<W` 推导；卷积 Padding 不使有效输出位置失效。
+3. Systolic/PostProcess/Pool 输出按自身事务中的空间坐标及全局 Cout 索引访问对应 HWC 文件；先判断空间和 Cout 有效性，再读取参考数组。对无效 Lane 的零 payload 和 mask 单独按硬件契约检查，不能越界读 HWC 文件。
+4. Cout 缓存块、Replay 和重复扫描由 TB/Top 调度解释，不改变这些数学参考文件；不要将逻辑 HWC 当作冻结后的完整 Feature DDR 物理布局。
+
+已有同名目标文件时，在处理图片前拒绝写入；不会清空旧 trace 或覆盖参数。运行中途若因磁盘/数值错误失败，之前已写的 BIN 可能保留，应另选输出目录后重试。
+
+Trace 绑定生成时的整套参数。重新导出不同 checkpoint 后，旧 trace 不能与新 `bins/` 混用；应保留对应参数目录并使用新的 trace 输出目录重新生成。建议利用 `export.py --output-dir` 和 `dump_trace.py --generated-dir` 保存独立实验，不覆盖正在用于 HLS 比较的参数。
+
+### Trace 测试和验证范围
+
+```bash
+python test_export.py
+python test_dump_trace.py
+python -m py_compile dump_trace.py test_dump_trace.py
+git diff --check
+```
+
+`test_dump_trace.py` 使用临时合成 BIN，验证 G=1/2/128、3×3/1×1、unfold 和 im2row 的独立坐标参考、RGB/Cout/空间尾部、长归约 MAC 的 INT64 对照、负值 Pool 边界、输入舍入、采样、43 个模块边界、BIN 回读、字节序、已有文件保护及错误参数拒绝；不运行训练。
+
+真实 smoke 验证使用当前已导出的参数，seed=1、1 张 VOC2007 test（index=2343、图像 ID `004709`），完整生成全部 43 个 BIN，共 78,060,697 字节。已对真实文件回读，验证全部 Pack 解包/补零、全部 PostProcess、全部 Pool 与独立参考一致，并对九层 MAC 做 INT64 抽查。单张 trace 不代表 mAP；QAT 与整数参考还可能因 bias 量化、系数近似及最近偶数/截断规则不同而产生误差。本功能没有执行全量精度评估或 HLS/Vivado/Vitis 仿真，不能据此声称硬件已经验证通过。
