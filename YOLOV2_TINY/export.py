@@ -53,9 +53,16 @@ def extract_fake_quant_params(fake_quant, name, channels=None):
     scale, zero = fake_quant.calculate_qparams()
     if torch.any(zero != 0) or torch.any(fake_quant.zero_point != 0):
         raise ValueError(f'{name}: 不支持非零 zero_point。')
-    if (not torch.equal(scale, fake_quant.scale) or not torch.equal(zero, fake_quant.zero_point)):
+    # GPU 训练保存的 scale 与 CPU calculate_qparams 可能相差一个 float32 ULP。
+    # 仅容忍一个相邻可表示值；导出仍采用 checkpoint 的实际 FQ scale，不重算替换它。
+    low = torch.nextafter(scale, torch.full_like(scale, -math.inf))
+    high = torch.nextafter(scale, torch.full_like(scale, math.inf))
+    if (scale.shape != fake_quant.scale.shape
+            or not torch.all((fake_quant.scale >= low) & (fake_quant.scale <= high))
+            or not torch.equal(zero, fake_quant.zero_point)):
         raise ValueError(f'{name}: Observer qparams 与 FakeQuant buffer 不一致。')
-    scale = positive_scale(scale.detach().cpu().numpy(), name).reshape(-1)
+    positive_scale(scale.detach().cpu().numpy(), f'{name} Observer')
+    scale = positive_scale(fake_quant.scale.detach().cpu().numpy(), name).reshape(-1)
     zero = zero.detach().cpu().numpy().astype(np.int32).reshape(-1)
     count = 1 if channels is None else channels
     if scale.size != count or zero.size != count or minimum.numel() != count:
@@ -226,7 +233,7 @@ def collect_layers(model, config):
 
 
 def write_layer(output, layer):
-    """保存 NPY、原始 INT8 权重 BIN 和 little-endian field-first 参数 BIN。"""
+    """NPY 按 MNIST 分类；所有 BIN 集中到 bins，bias 独立，M/S 合并为 quant。"""
     name = layer['name']
     arrays = {'weight': (f'weights/{name}_weight_int8.npy', layer['logical']),
               'bias': (f'biases/{name}_bias_int32.npy', layer['bias'])}
@@ -243,9 +250,11 @@ def write_layer(output, layer):
         files[key] = dict(path=relative, dtype=array.dtype.str, shape=list(array.shape),
                           order='C', byte_order='not_applicable' if array.itemsize == 1 else 'little',
                           data_nbytes=array.nbytes, file_size_bytes=path.stat().st_size, container='npy')
-    params = np.concatenate([layer[key] for key in ('bias', 'multiplier', 'shift')]).astype('<i4')
-    for key, relative, array in (('weight_packed', f'weights/{name}_weight_packed.bin', layer['packed']),
-                                 ('params', f'params/{name}_params.bin', params)):
+    quant = np.concatenate([layer[key] for key in ('multiplier', 'shift')]).astype('<i4')
+    # weight/bias/quant 与 MNIST 的硬件 header 命名对应；BIN 不再散落在 NPY 目录中。
+    for key, relative, array in (('weight_bin', f'bins/{name}_weight.bin', layer['packed']),
+                                 ('bias_bin', f'bins/{name}_bias.bin', layer['bias'].astype('<i4')),
+                                 ('quant_bin', f'bins/{name}_quant.bin', quant)):
         path = output / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(array.tobytes(order='C'))
@@ -255,6 +264,10 @@ def write_layer(output, layer):
                           byte_order='not_applicable' if array.itemsize == 1 else 'little',
                           data_nbytes=array.nbytes, file_size_bytes=path.stat().st_size, container='raw')
     cout, cin, kh, kw = layer['original_shape']
+    # 偏移均相对于各自文件起点，不能继续套用旧 bias/M/S 三段合并文件的偏移。
+    files['bias_bin'].update(fields=['bias'], count_per_field=cout, field_byte_offsets=[0])
+    files['quant_bin'].update(fields=['multiplier', 'shift'], count_per_field=cout,
+                              field_byte_offsets=[0, cout*4])
     metadata = dict(name=name, original_oihw_shape=layer['original_shape'],
                     logical_weight_shape=list(layer['logical'].shape), packed_weight_shape=list(layer['packed'].shape),
                     Cin=cin, Cout=cout, G=(cin+7)//8, R=kh*kw*((cin+7)//8),
@@ -264,8 +277,7 @@ def write_layer(output, layer):
                     leaky_relu=layer['leaky_relu'], weight_per_channel_axis=0,
                     logical_weight_order='kh,kw,cin,cout',
                     packed_weight_order='global_cout_tile,kh,kw,cin_group,cout_lane,cin_lane',
-                    params_order=['bias', 'multiplier', 'shift'], params_count_per_field=cout,
-                    params_field_byte_offsets=[0, cout*4, cout*8], files=files)
+                    params_count_per_field=cout, files=files)
     for key in ('weight_scale', 'weight_zero_point', 'input_scale', 'input_zero_point', 'output_scale',
                 'output_zero_point', 'bias_scale', 'multiplier', 'shift', 'real_multiplier'):
         metadata[key] = layer[key].tolist()
@@ -275,18 +287,23 @@ def write_layer(output, layer):
 def export_checkpoint(checkpoint, output_dir):
     """严格恢复新 QAT，禁用 Observer，先校验所有层，再导出；不再次折叠已加载的 BN。"""
     checkpoint, output_dir = Path(checkpoint).resolve(), Path(output_dir).resolve()
+    metadata_path = output_dir/'metadata.json'
+    if metadata_path.exists() and json.loads(metadata_path.read_text(encoding='utf-8')).get('format_version') != 2:
+        raise ValueError('输出目录包含旧版导出；请另选空目录或先备份整理，不能混用旧 params BIN 与新 bins。')
     model = load_qat_model(checkpoint, torch.device('cpu')).eval()
     model.apply(disable_observer)
     state = torch.load(checkpoint, map_location='cpu', weights_only=False)
     layers = collect_layers(model, state['config'])
-    metadata = dict(format_version=1, weight_layout_version=3, qat_scheme=QAT_SCHEME,
+    metadata = dict(format_version=2, weight_layout_version=3, qat_scheme=QAT_SCHEME,
                     checkpoint=dict(path=str(checkpoint), sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
                                     epoch=state.get('epoch')), model_config=state['config']['model'],
                     layer_order=list(LAYER_NAMES), pytorch_feature_layout='NCHW',
                     hardware_stream_order='H,W,channel_group8,channel_lane8', feature_ddr_layout='not_frozen',
                     datatypes=dict(input='int8', weight='int8', accumulator='int32', bias='int32', product='int64'),
                     quantization=dict(range=[-128, 127], activation='per_tensor_symmetric',
-                                      weight='per_channel_symmetric', zero_point=0),
+                                      weight='per_channel_symmetric', zero_point=0,
+                                      scale_source='checkpoint FakeQuant.scale',
+                                      observer_scale_validation='calculate_qparams; at most 1 ULP difference'),
                     postprocess=dict(alpha_multiplier=ALPHA_MULTIPLIER, alpha_shift=ALPHA_SHIFT,
                                      negative_multiplier='(int64(M)*1717986918 + 2**33) >> 34',
                                      negative_multiplier_rounding='nearest_half_up',
@@ -303,8 +320,9 @@ def export_checkpoint(checkpoint, output_dir):
     for layer in metadata['layers']:
         print(f"{layer['name']}: OIHW={layer['original_oihw_shape']} "
               f"logical={layer['logical_weight_shape']} packed={layer['packed_weight_shape']} "
-              f"weight_bytes={layer['files']['weight_packed']['file_size_bytes']} "
-              f"params_bytes={layer['files']['params']['file_size_bytes']}")
+              f"weight_bytes={layer['files']['weight_bin']['file_size_bytes']} "
+              f"bias_bytes={layer['files']['bias_bin']['file_size_bytes']} "
+              f"quant_bytes={layer['files']['quant_bin']['file_size_bytes']}")
     print(f'导出完成：{output_dir}')
     return metadata
 

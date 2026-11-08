@@ -113,7 +113,9 @@ activation 为 per-tensor symmetric qint8，weight 为原始 OIHW 的 OC 轴（a
 python train.py --mode qat
 ```
 
-`save_checkpoint()` 仅对通过结构检查的 QAT 写入新方案标记，普通 FP32 不写标记。`load_qat_model()` 先检查标记，再恢复融合后的 QAT 结构并 strict=True 加载；缺少标记、旧标记、额外旧边界参数均不能通过，不使用 strict=False。现有旧 QAT 文件未被修改，直接评估/导出会报“请从 FP32 重新进行 QAT 微调”。
+`save_checkpoint()` 仅对通过结构检查的 QAT 写入新方案标记，普通 FP32 不写标记。`load_qat_model()` 先检查标记，再恢复融合后的 QAT 结构并 strict=True 加载；缺少标记、旧标记、额外旧边界参数均不能通过，不使用 strict=False。历史双边界 QAT 不自动迁移，加载时会提示“请从 FP32 重新进行 QAT 微调”。
+
+2026-11-08 本地文件核查：`qat_model.pth`（epoch 4）和 `qat_model_best.pth`（epoch 3）均已是 `single_postprocess_v1`，严格恢复成功；前八层激活前的 FakeQuant 状态键为 0，LeakyReLU 后的 scale 为 8 个，共 9 个 weight / 10 个 activation FakeQuant 且全部启用。因此这两个文件不需要因为边界调整再次训练。此核查不等同于新一轮 mAP 测试。
 
 ## 参数导出命令与范围
 
@@ -123,9 +125,9 @@ python export.py
 python export.py --checkpoint checkpoints/qat_model_best.pth --output-dir generated
 ```
 
-默认读取本工程 `checkpoints/qat_model.pth`。仅支持 416×416 RGB、VOC 固定 20 类/类别顺序、5 个既定 VOC anchors 和 125 个逻辑输出通道，不宣称支持任意检测网络。现有旧双边界 checkpoint **无法正式导出**，请先重新微调。预处理仍为 RGB、等比例 letterbox、像素 `[0,1]`，不使用 MNIST mean/std。
+默认读取本工程 `checkpoints/qat_model.pth`。仅支持 416×416 RGB、VOC 固定 20 类/类别顺序、5 个既定 VOC anchors 和 125 个逻辑输出通道，不宣称支持任意检测网络。历史旧双边界 checkpoint **无法正式导出**，而上文已核查的新方案文件可使用本导出入口。预处理仍为 RGB、等比例 letterbox、像素 `[0,1]`，不使用 MNIST mean/std。
 
-导出流程：通过更新后的 `load_qat_model()` 严格恢复 → eval、禁用所有 Observer → 从已初始化的官方 Observer `calculate_qparams()` 读取 scale/zero_point → 检查与 FakeQuant buffer 一致 → 校验全部 9 层并准备数组 → 保存 NPY/BIN → 最后写 metadata。Exporter 不对已经恢复的卷积重复折叠 BN，不喂新图像更新 scale，也不调用 `torch.ao.quantization.convert()`。
+导出流程：通过更新后的 `load_qat_model()` 严格恢复 → eval、禁用所有 Observer → 用已初始化的官方 Observer `calculate_qparams()` 复核 qparams → 保留 checkpoint 实际使用的 FakeQuant scale/zero_point → 校验全部 9 层并准备数组 → 保存 NPY/BIN → 最后写 metadata。GPU 保存的 scale 与 CPU 重算可能相差一个 float32 ULP，只允许相邻一个可表示值的误差；更大差异仍拒绝，zero_point 必须严格一致。不会用 CPU 重算值覆盖已训练 scale，也不会放宽权重整数逐元素一致的检查；metadata 记录 scale 来源和复核规则。Exporter 不对已经恢复的卷积重复折叠 BN，不喂新图像更新 scale，也不调用 `torch.ao.quantization.convert()`。
 
 空/未初始化 Observer、无效 scale、非零 zero_point、错误 qscheme/轴/范围、关闭的 FakeQuant、权重逐元素核对失败、INT32 bias/M/S 溢出或负 shift 均明确报错。层参数错误包含层名，且在全部验证通过前不会创建输出文件。
 
@@ -136,7 +138,6 @@ python export.py --checkpoint checkpoints/qat_model_best.pth --output-dir genera
 ```text
 generated/
 ├── weights/<layer>_weight_int8.npy       # 逻辑 [Kh*Kw*Cin,Cout]，INT8
-├── weights/<layer>_weight_packed.bin     # 物理 Pack，无头 INT8 原始字节
 ├── biases/<layer>_bias_int32.npy         # [Cout]，INT32
 ├── quant_params/<layer>_multiplier_int32.npy  # [Cout]，INT32
 ├── quant_params/<layer>_shift_int32.npy       # [Cout]，INT32 总右移量
@@ -146,11 +147,15 @@ generated/
 ├── quant_params/<layer>_input_zero_point.npy # [1]，INT32，全 0
 ├── quant_params/<layer>_output_scale.npy     # [1]，float64
 ├── quant_params/<layer>_output_zero_point.npy # [1]，INT32，全 0
-├── params/<layer>_params.bin             # bias完整数组 → M完整数组 → S完整数组
+├── bins/<layer>_weight.bin              # 物理 Pack，无头 INT8 原始字节
+├── bins/<layer>_bias.bin                # [Cout]，little-endian INT32
+├── bins/<layer>_quant.bin               # M完整数组 → S完整数组，little-endian INT32
 └── metadata.json
 ```
 
 scale 从 PyTorch qparams 读取后以 float64 保存，不会增加原始 qparams 的有效精度；它们用于离线分析和核对，不供 FPGA 浮点计算。bias_scale 和实数 r 保存在 metadata，不再导出第二组中间 scale、正负分支参数或 `M_negative` 文件。不生成巨型 `.h`、DDR 内存分配表、DMA 或 Feature Map 物理数据。
+
+文件分类和命名对齐 MNIST：逻辑 NPY 分别放在 `weights/`、`biases/`、`quant_params/`；硬件数据集中存放，MNIST 的集中目录是 `headers/`，YOLO 使用 `bins/`。二进制文件使用相同的 `<layer>_weight`、`<layer>_bias`、`<layer>_quant` 命名。所有 `.bin` 只放在 `bins/`，bias 独立，multiplier/shift 合并，不再生成 `params/` 或 `*_weight_packed.bin`。
 
 ### 权重和 bias 的数值来源
 
@@ -245,23 +250,25 @@ weight_bin_bytes = ceil(Cout/4)*R*32
 
 上式是**字节偏移**，不是 64-bit word 偏移；需要 word 索引时必须另外除以 8。Exporter 不生成任何 DDR 物理地址。
 
-参数 BIN 为明确的 little-endian signed INT32（NumPy `<i4`），field-first，非逐通道交错：
+bias 和 quant BIN 都为明确的 little-endian signed INT32（NumPy `<i4`）：
 
 ```text
-bias[0:Cout] → multiplier[0:Cout] → shift[0:Cout]
-各字段 byte_offset：0、4*Cout、8*Cout
-params_bin_bytes = 3*Cout*4
+bins/<layer>_bias.bin：bias[0:Cout]
+  bias byte_offset=0，文件长度=Cout*4
+
+bins/<layer>_quant.bin：multiplier[0:Cout] → shift[0:Cout]
+  multiplier byte_offset=0，shift byte_offset=4*Cout，文件长度=2*Cout*4
 ```
 
-参数不按物理 Cout 补齐。Prediction 各字段只有 125 个元素，参数 BIN 为 1500 字节；不保存 M_negative、alpha 或无效 Cout 参数。**读取方必须先判断 oc<Cout，再读 bias/M/S，不能越界读取后才屏蔽 cout_valid。** 所有文件大小由实际数组 nbytes 生成并核验；NPY 的文件字节数另含头部，不等于其 data_nbytes。
+quant 使用 field-first，不是逐通道交错 M/S；所有偏移相对于各自文件起点。参数不按物理 Cout 补齐。Prediction 各字段只有 125 个元素，bias BIN 为 500 字节，quant BIN 为 1000 字节；不保存 M_negative、alpha 或无效 Cout 参数。**读取方必须先判断 oc<Cout，再读 bias/M/S，不能越界读取后才屏蔽 cout_valid。** 所有文件大小由实际数组 nbytes 生成并核验；NPY 的文件字节数另含头部，不等于其 data_nbytes。
 
 ### Metadata
 
-`metadata.json` 使用独立的 `format_version=1`、`weight_layout_version=3`，不是 MNIST 的版本号。包含：
+`metadata.json` 使用独立的 `format_version=2`、`weight_layout_version=3`，不是 MNIST 的版本号。v2 只改变文件分类和参数拆分，不改变 QAT 方案、权重物理布局或数值算法，因此不要求重新训练。v1 的 `weights/*_weight_packed.bin` 和 `params/*_params.bin` 不再输出；读取方必须改用 metadata 中的 `files.weight_bin`、`files.bias_bin`、`files.quant_bin` 描述。特别是 quant 文件的 M 从偏移 0 开始，不能再使用旧 params 文件的偏移。已有 v1 输出目录会明确拒绝覆盖，请另选空目录或先备份整理，避免新旧文件混用；导出器不会擅自删除旧文件。包含：
 
 - qat_scheme、checkpoint 路径/SHA256/epoch、固定网络配置、层顺序。
 - OIHW/逻辑/物理 shape，Cin/Cout/G/R、逻辑和物理通道数、卷积 geometry。
-- 文件相对路径、dtype、C 顺序、字节序、data_nbytes 和实际 file_size_bytes；参数 field-first 顺序、每字段真实数量和字节偏移。
+- 文件相对路径、dtype、C 顺序、字节序、data_nbytes 和实际 file_size_bytes；`bias_bin` / `quant_bin` 各自的 fields、count_per_field 和 field_byte_offsets。
 - weight 的原始 per-channel 轴、scale/zero_point；input/output scale/zero_point、bias_scale、实数 r、实际 M/S。
 - 固定 alpha 常量、负系数派生公式及其 half-up 舍入、最终算术右移截断语义、各层是否启用 LeakyReLU。
 - PyTorch 逻辑 Feature 为 NCHW，硬件 stream 顺序为 `H→W→group8→lane8`；`feature_ddr_layout=not_frozen`。本轮不冻结完整 Feature DDR 布局。
@@ -278,4 +285,4 @@ git diff --check
 
 测试只在临时目录创建随机合成 FP32/QAT checkpoint、随机输入校准和导出文件，覆盖 416 forward 的 19 个 FQ、FP32 初始化、严格恢复及旧结构拒绝、九层 Shape/BIN 全量回读、负补码、G=1/2/128、Cin/Cout 补零、little-endian field-first 参数、整数正负分支/截断/饱和及错误参数拒绝。随机校准不是训练，测试通过不代表检测精度达标。
 
-当前尚无已验证精度的新结构 QAT checkpoint：旧结构的 mAP 不能作为新结构结果。本轮未运行完整训练、VOC 全量 mAP、完整 YOLO 整数 Golden 推理、HLS/Vivado/Vitis 仿真或硬件验证；这些仍需后续完成。
+当前已有通过新方案结构核查的本地 QAT checkpoint；旧结构的 mAP 不能作为新结构结果。本次文件整理未运行训练、VOC 全量 mAP、完整 YOLO 整数 Golden 推理、HLS/Vivado/Vitis 仿真或硬件验证，不能仅凭结构和 BIN 测试声称其精度或硬件效果已验证。

@@ -130,7 +130,7 @@ class ExportTests(unittest.TestCase):
         """九层 BIN 全量解包等于 NPY，并独立按字节索引抽查 Pack/补零/参数。"""
         output = self.folder/'generated'
         meta = json.loads((output/'metadata.json').read_text())
-        self.assertEqual((meta['format_version'], meta['weight_layout_version']), (1, 3))
+        self.assertEqual((meta['format_version'], meta['weight_layout_version']), (2, 3))
         self.assertEqual(meta['qat_scheme'], QAT_SCHEME)
         self.assertEqual(meta['layer_order'], list(LAYER_NAMES))
         rng = np.random.default_rng(1)
@@ -141,7 +141,7 @@ class ExportTests(unittest.TestCase):
             self.assertEqual((cin, cout), (CHANNELS[index], CHANNELS[index+1]))
             self.assertEqual(tuple(layer['packed_weight_shape']), PACKED_SHAPES[index])
             logical = np.load(output/files['weight']['path'])
-            packed = np.fromfile(output/files['weight_packed']['path'], dtype=np.int8).reshape(PACKED_SHAPES[index])
+            packed = np.fromfile(output/files['weight_bin']['path'], dtype=np.int8).reshape(PACKED_SHAPES[index])
             tiles, tokens, _, _ = packed.shape
             groups = (cin+7)//8
             decoded = packed.reshape(tiles, kh*kw, groups, 4, 8).transpose(1, 2, 4, 0, 3)
@@ -149,7 +149,7 @@ class ExportTests(unittest.TestCase):
             np.testing.assert_array_equal(decoded[:, :cin, :cout].reshape(-1, cout), logical)
             self.assertTrue(np.all(decoded[:, cin:, :] == 0))
             self.assertTrue(np.all(decoded[:, :, cout:] == 0))
-            data = (output/files['weight_packed']['path']).read_bytes()
+            data = (output/files['weight_bin']['path']).read_bytes()
             self.assertEqual(len(data), tiles*tokens*32)
             for _ in range(20):
                 t, token = int(rng.integers(tiles)), int(rng.integers(tokens))
@@ -159,9 +159,12 @@ class ExportTests(unittest.TestCase):
                 expected = int(logical[q*cin+ic, oc]) if ic < cin and oc < cout else 0
                 byte = data[32*(t*tokens+token)+8*lane+ilane]
                 self.assertEqual(byte, expected & 255)
-            params_data = (output/files['params']['path']).read_bytes()
-            self.assertEqual(len(params_data), 3*cout*4)
-            fields = np.frombuffer(params_data, dtype='<i4').reshape(3, cout)
+            bias_data = (output/files['bias_bin']['path']).read_bytes()
+            quant_data = (output/files['quant_bin']['path']).read_bytes()
+            self.assertEqual(len(bias_data), cout*4)
+            self.assertEqual(len(quant_data), 2*cout*4)
+            fields = [np.frombuffer(bias_data, dtype='<i4'),
+                      *np.frombuffer(quant_data, dtype='<i4').reshape(2, cout)]
             for field_index, key in enumerate(('bias', 'multiplier', 'shift')):
                 array = np.load(output/files[key]['path'])
                 self.assertEqual(array.dtype, np.dtype('<i4'))
@@ -171,9 +174,19 @@ class ExportTests(unittest.TestCase):
             previous_scale = layer['output_scale']
             for descriptor in files.values():
                 self.assertEqual((output/descriptor['path']).stat().st_size, descriptor['file_size_bytes'])
-            self.assertEqual(layer['params_field_byte_offsets'], [0, cout*4, cout*8])
-            print(f'PASS {name}: packed={packed.shape}, weight={len(data)} B, params={len(params_data)} B')
-        self.assertEqual(meta['layers'][-1]['files']['params']['file_size_bytes'], 1500)
+            self.assertEqual(files['bias_bin']['fields'], ['bias'])
+            self.assertEqual(files['bias_bin']['field_byte_offsets'], [0])
+            self.assertEqual(files['quant_bin']['fields'], ['multiplier', 'shift'])
+            self.assertEqual(files['quant_bin']['field_byte_offsets'], [0, cout*4])
+            for key, suffix in (('weight_bin', 'weight'), ('bias_bin', 'bias'), ('quant_bin', 'quant')):
+                self.assertEqual(files[key]['path'], f'bins/{name}_{suffix}.bin')
+            print(f'PASS {name}: packed={packed.shape}, weight={len(data)} B, '
+                  f'bias={len(bias_data)} B, quant={len(quant_data)} B')
+        self.assertEqual(meta['layers'][-1]['files']['bias_bin']['file_size_bytes'], 500)
+        self.assertEqual(meta['layers'][-1]['files']['quant_bin']['file_size_bytes'], 1000)
+        self.assertEqual(len(list(output.glob('bins/*.bin'))), 27)
+        self.assertEqual(len(list(output.rglob('*.bin'))), 27)
+        self.assertFalse((output/'params').exists())
 
     def test_signed_bytes_and_group_padding(self):
         """显式覆盖负补码及 Cin=3/16/1024，独立 kernel 补齐，不跨位置拼接。"""
@@ -259,6 +272,21 @@ class ExportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '416'):
             validate_hardware_config(bad, self.model)
 
+    def test_checkpoint_scale_backend_roundoff(self):
+        """允许一 ULP 的后端重算差异，但保留 checkpoint scale；拒绝真实不一致。"""
+        fq = create_fpga_qconfig().activation()
+        fq(torch.tensor([-1., 1.]))
+        fq.disable_observer()
+        calculated, _ = fq.calculate_qparams()
+        saved = torch.nextafter(calculated, torch.full_like(calculated, float('inf')))
+        fq.scale.copy_(saved)
+        exported, _ = extract_fake_quant_params(fq, 'one_ulp')
+        np.testing.assert_array_equal(exported, saved.numpy().astype(np.float64))
+        torch.testing.assert_close(fq.calculate_qparams()[0], calculated, rtol=0, atol=0)
+        fq.scale.copy_(torch.nextafter(saved, torch.full_like(saved, float('inf'))))
+        with self.assertRaisesRegex(ValueError, '不一致'):
+            extract_fake_quant_params(fq, 'two_ulp')
+
     def test_validation_before_any_write(self):
         """最后一层 bias 出错也必须在创建输出文件之前失败，错误包含层名。"""
         saved = self.model.prediction.bias.detach().clone()
@@ -272,6 +300,13 @@ class ExportTests(unittest.TestCase):
         finally:
             with torch.no_grad():
                 self.model.prediction.bias.copy_(saved)
+        legacy = self.folder/'legacy_output'
+        legacy.mkdir()
+        (legacy/'metadata.json').write_text('{"format_version": 1}')
+        with self.assertRaisesRegex(ValueError, '旧版导出'):
+            export_checkpoint(self.folder/'qat.pth', legacy)
+        self.assertEqual((legacy/'metadata.json').read_text(), '{"format_version": 1}')
+        self.assertEqual(len(list(legacy.iterdir())), 1)
 
 
 if __name__ == '__main__':
