@@ -1,0 +1,52 @@
+# Network defaults follow pjreddie/darknet yolov2-tiny-voc.cfg.
+model:
+  input_height: 416
+  input_width: 416
+  num_classes: 20
+  num_anchors: 5
+  # Anchor width and height are in output-grid cell units at 416x416.
+  anchors:
+    - [1.08, 1.19]
+    - [3.42, 4.41]
+    - [6.63, 11.38]
+    - [9.42, 5.11]
+    - [16.62, 10.52]
+  classes:
+    - aeroplane
+    - bicycle
+    - bird
+    - boat
+    - bottle
+    - bus
+    - car
+    - cat
+    - chair
+    - cow
+    - diningtable
+    - dog
+    - horse
+    - motorbike
+    - person
+    - pottedplant
+    - sheep
+    - sofa
+    - train
+    - tvmonitor
+
+data:
+  root: data/VOCdevkit
+  train: [[2007, train], [2012, train]]
+  validation: [[2007, val], [2012, val]]
+  evaluation: [[2007, test]]
+
+training:
+  seed: 1
+  batch_size: 8
+  num_workers: 4
+  float_epochs: 160
+  float_learning_rate: 0.001
+  float_milestones: [100, 140]
+  qat_epochs: 20
+  qat_learning_rate: 0.0001
+  qat_milestones: [10, 15]
+  qat_observer_freeze_epoch: 15

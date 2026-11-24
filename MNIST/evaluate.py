@@ -1,5 +1,6 @@
 """Evaluate saved FP32 and QAT checkpoints on the MNIST validation set."""
 
+import argparse
 from pathlib import Path
 
 import torch
@@ -15,10 +16,16 @@ ROOT = Path(__file__).resolve().parent
 
 def main() -> None:
     """Print FP32 and QAT validation accuracy plus their difference."""
-    config = load_config()
-    device = select_device()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config', type=Path, default=ROOT / 'config.yaml')
+    parser.add_argument('--device', default='auto')
+    parser.add_argument('--float-checkpoint', type=Path, default=ROOT / 'checkpoints/float_model.pth')
+    parser.add_argument('--qat-checkpoint', type=Path, default=ROOT / 'checkpoints/qat_model.pth')
+    args = parser.parse_args()
+    config = load_config(args.config)
+    device = select_device(args.device)
     _, valid_loader = create_mnist_loaders(ROOT / config["data_dir"], config["batch_size"], config["num_workers"])
-    float_path, qat_path = ROOT / "checkpoints/float_model.pth", ROOT / "checkpoints/qat_model.pth"
+    float_path, qat_path = args.float_checkpoint, args.qat_checkpoint
     if not float_path.exists() or not qat_path.exists():
         raise FileNotFoundError("Both float_model.pth and qat_model.pth are required. Train FP32 then QAT first.")
     float_model = MnistCnn().to(device)

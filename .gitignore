@@ -9,18 +9,44 @@ __pycache__/
 venv/
 env/
 .vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+*~
+/build/
+/dist/
+/artifacts/
+/runs/
+*.egg-info/
+.coverage
+htmlcov/
 
 # Downloaded MNIST data and training checkpoints
-CNN_FPGA/data/
-CNN_FPGA/checkpoints/*
-!CNN_FPGA/checkpoints/.gitkeep
+MNIST/data/
+MNIST/checkpoints/*
+!MNIST/checkpoints/.gitkeep
 *.pth
 *.pt
 *.ckpt
+*.weights
+*.onnx
+*.tflite
+*.safetensors
+*.bin
+*.npy
+*.npz
+
+# Downloaded VOC data and YOLO training checkpoints
+YOLOV2_TINY/data/
+YOLOV2_TINY/checkpoints/*
+!YOLOV2_TINY/checkpoints/.gitkeep
 
 # Generated FPGA parameter exports (NPY/JSON/BIN/headers belong here)
-CNN_FPGA/generated/*
-!CNN_FPGA/generated/.gitkeep
+MNIST/generated/*
+!MNIST/generated/.gitkeep
+YOLOV2_TINY/generated/*
+!YOLOV2_TINY/generated/.gitkeep
 
 # Common FPGA/HLS build products; future source headers remain tracked
 .Xil/
