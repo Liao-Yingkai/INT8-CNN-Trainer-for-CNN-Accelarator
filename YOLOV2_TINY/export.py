@@ -294,8 +294,10 @@ def export_checkpoint(checkpoint, output_dir):
     model.apply(disable_observer)
     state = torch.load(checkpoint, map_location='cpu', weights_only=False)
     layers = collect_layers(model, state['config'])
+    # 来源不是加载地址：目录内记相对路径，外部 checkpoint 仅记文件名，以 SHA256 标识内容。
+    source = checkpoint.relative_to(ROOT).as_posix() if checkpoint.is_relative_to(ROOT) else checkpoint.name
     metadata = dict(format_version=2, weight_layout_version=3, qat_scheme=QAT_SCHEME,
-                    checkpoint=dict(path=str(checkpoint), sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+                    checkpoint=dict(path=source, sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
                                     epoch=state.get('epoch')), model_config=state['config']['model'],
                     layer_order=list(LAYER_NAMES), pytorch_feature_layout='NCHW',
                     hardware_stream_order='H,W,channel_group8,channel_lane8', feature_ddr_layout='not_frozen',

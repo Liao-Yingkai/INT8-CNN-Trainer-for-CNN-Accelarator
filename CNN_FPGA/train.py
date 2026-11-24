@@ -16,15 +16,19 @@ from quant import prepare_qat_model, save_checkpoint
 ROOT = Path(__file__).resolve().parent
 
 
-def load_config() -> Dict[str, Any]:
+def load_config(config_path: str | Path | None = None) -> Dict[str, Any]:
     """Read project hyperparameters from config.yaml."""
-    with (ROOT / "config.yaml").open("r", encoding="utf-8") as file:
+    with Path(config_path or ROOT / "config.yaml").open("r", encoding="utf-8") as file:
         return yaml.safe_load(file)
 
 
-def select_device() -> torch.device:
+def select_device(name: str = "auto") -> torch.device:
     """Select the first CUDA GPU when available, otherwise use CPU."""
-    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if name == "auto":
+        name = "cuda:0" if torch.cuda.is_available() else "cpu"
+    if name.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was explicitly requested but is not available; select --device cpu.")
+    return torch.device(name)
 
 
 def evaluate_accuracy(model: nn.Module, loader: torch.utils.data.DataLoader, device: torch.device) -> float:
@@ -76,9 +80,12 @@ def main() -> None:
     """Parse CLI options and execute either FP32 training or QAT fine-tuning."""
     parser = argparse.ArgumentParser(description="MNIST FP32/QAT training for an INT8 FPGA CNN")
     parser.add_argument("--mode", choices=("float", "qat"), required=True)
+    parser.add_argument("--config", type=Path, default=ROOT / "config.yaml")
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--float-checkpoint", type=Path, default=ROOT / "checkpoints/float_model.pth")
     args = parser.parse_args()
-    config = load_config()
-    device = select_device()
+    config = load_config(args.config)
+    device = select_device(args.device)
     print(f"Using device: {device}")
     loaders = create_mnist_loaders(ROOT / config["data_dir"], config["batch_size"], config["num_workers"])
     train_loader, valid_loader = loaders
@@ -88,7 +95,7 @@ def main() -> None:
         train_model(model, train_loader, valid_loader, device, config["float_epochs"], config["float_learning_rate"], ROOT / "checkpoints/float_model.pth")
         return
 
-    float_path = ROOT / "checkpoints/float_model.pth"
+    float_path = args.float_checkpoint
     if not float_path.exists():
         raise FileNotFoundError("Run `python train.py --mode float` before QAT fine-tuning.")
     fp32_model = MnistCnn().to(device)

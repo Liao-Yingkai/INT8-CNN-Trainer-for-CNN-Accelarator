@@ -61,16 +61,18 @@ def evaluate(model, loader, device, score_threshold=.01):
 
 def main():
     """Evaluate a saved floating-point checkpoint on configured evaluation split."""
-    from train import load_config, make_loader, build_model
+    from train import ROOT, load_config, make_loader, build_model, select_device
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['float', 'qat', 'both'], default='both')
+    parser.add_argument('--config', type=Path, default=ROOT/'config.yaml')
+    parser.add_argument('--device', default='auto')
     parser.add_argument('--float-checkpoint', type=Path,
                         default=Path(__file__).parent/'checkpoints/float_model.pth')
     parser.add_argument('--qat-checkpoint', type=Path,
                         default=Path(__file__).parent/'checkpoints/qat_model.pth')
     args = parser.parse_args()
-    config = load_config()
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    config = load_config(args.config)
+    device = select_device(args.device)
     from quant import load_qat_model
     scores = {}
     modes = ['float', 'qat'] if args.mode == 'both' else [args.mode]

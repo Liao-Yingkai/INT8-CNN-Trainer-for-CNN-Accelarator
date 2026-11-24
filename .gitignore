@@ -9,6 +9,18 @@ __pycache__/
 venv/
 env/
 .vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+*~
+/build/
+/dist/
+/artifacts/
+/runs/
+*.egg-info/
+.coverage
+htmlcov/
 
 # Downloaded MNIST data and training checkpoints
 CNN_FPGA/data/
@@ -17,6 +29,13 @@ CNN_FPGA/checkpoints/*
 *.pth
 *.pt
 *.ckpt
+*.weights
+*.onnx
+*.tflite
+*.safetensors
+*.bin
+*.npy
+*.npz
 
 # Downloaded VOC data and YOLO training checkpoints
 YOLOV2_TINY/data/

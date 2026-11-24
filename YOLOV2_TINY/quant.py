@@ -36,7 +36,7 @@ def _prepare_structure(model):
     model.fuse_model()
     model.train()
     config = create_fpga_qconfig()
-    # 与本机官方 default_weight_only_qconfig 相同，Identity 不观察或量化激活；
+    # 与官方 default_weight_only_qconfig 相同，Identity 不观察或量化激活；
     # 不能把 Conv.qconfig 设为 None，否则 prepare_qat 不会创建 weight FakeQuant。
     weight_only = QConfig(activation=nn.Identity, weight=config.weight)
     # 默认关闭继承，仅显式启用白名单叶子，容器、BN Identity 和 Pool 均不量化。

@@ -1,17 +1,17 @@
-import torch
+"""Compatibility shortcut; prefer scripts/inspect_checkpoint.py for new use."""
 from pathlib import Path
+import sys
 
-def test():
-    Root = Path(__file__).resolve().parent
-    checkpoint_float = Root / "checkpoints/float_model_best.pth"
-    checkpoint_qat = Root / "checkpoints/qat_model_best.pth"
-    dict_float = torch.load(checkpoint_float)
-    dict_qat = torch.load(checkpoint_qat)
-    print("float model state dict\r\n")
-    print(dict_float["model_state_dict"])
-    print("\r\n")
-    print("qat model state dict\r\n")
-    print(dict_qat["model_state_dict"])
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT.parent))
+from scripts.inspect_checkpoint import inspect_checkpoint
+
+
+def main():
+    """Keep the former two-best-checkpoint shortcut without printing full tensors."""
+    for name in ('float_model_best.pth', 'qat_model_best.pth'):
+        inspect_checkpoint(ROOT/'checkpoints'/name)
+
 
 if __name__ == "__main__":
-    test()
+    main()

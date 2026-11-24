@@ -14,15 +14,24 @@ from torch.ao.quantization import disable_observer
 ROOT = Path(__file__).resolve().parent
 
 
-def load_config():
+def load_config(config_path=None):
     """Read the project configuration."""
-    config = yaml.safe_load((ROOT / 'config.yaml').read_text())
+    config = yaml.safe_load(Path(config_path or ROOT / 'config.yaml').read_text(encoding='utf-8'))
     model = config['model']
     if model['num_classes'] != len(model['classes']):
         raise ValueError('num_classes must match the class-name list.')
     if model['num_anchors'] != len(model['anchors']):
         raise ValueError('num_anchors must match the anchor list.')
     return config
+
+
+def select_device(name='auto'):
+    """自动选择设备或尊重显式配置，不依赖特定计算设备。"""
+    if name == 'auto':
+        name = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    if name.startswith('cuda') and not torch.cuda.is_available():
+        raise RuntimeError('CUDA was explicitly requested but is not available; select --device cpu.')
+    return torch.device(name)
 
 
 def make_loader(config, split, augment):
@@ -80,12 +89,15 @@ def main():
     """Run FP32 training or lower-learning-rate QAT initialized from FP32."""
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['float', 'qat'], required=True)
+    parser.add_argument('--config', type=Path, default=ROOT/'config.yaml')
+    parser.add_argument('--device', default='auto')
+    parser.add_argument('--float-checkpoint', type=Path, default=ROOT/'checkpoints/official_voc_fp32.pth')
     args = parser.parse_args()
-    config = load_config()
+    config = load_config(args.config)
     random.seed(config['training']['seed']); torch.manual_seed(config['training']['seed'])
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    device = select_device(args.device)
     print(f'Using {device}')
-    float_path = ROOT / 'checkpoints/official_voc_fp32.pth'
+    float_path = args.float_checkpoint
     if args.mode == 'qat':
         state = torch.load(float_path, map_location='cpu', weights_only=False)
         config['model'] = state['config']['model']

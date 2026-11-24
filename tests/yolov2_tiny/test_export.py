@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import sys
 
 import numpy as np
 import torch
@@ -11,6 +12,9 @@ import torch.nn.functional as F
 import yaml
 from torch.ao.quantization import disable_observer, disable_fake_quant
 from torch.ao.quantization.fake_quantize import FakeQuantizeBase
+
+ROOT = Path(__file__).resolve().parents[2]/'YOLOV2_TINY'
+sys.path.insert(0, str(ROOT))
 
 from quant import (QAT_SCHEME, build_model, create_fpga_qconfig, load_qat_model,
                    prepare_qat_model, save_checkpoint, validate_qat_structure)
@@ -20,7 +24,6 @@ from export import (CHANNELS, LAYER_NAMES, calculate_requant_params, checked_int
                     pack_weight, positive_scale, quantize_weight_per_channel,
                     validate_hardware_config)
 
-ROOT = Path(__file__).resolve().parent
 PACKED_SHAPES = [(4, 9, 4, 8), (8, 18, 4, 8), (16, 36, 4, 8), (32, 72, 4, 8),
                  (64, 144, 4, 8), (128, 288, 4, 8), (256, 576, 4, 8),
                  (256, 1152, 4, 8), (32, 128, 4, 8)]
@@ -132,6 +135,8 @@ class ExportTests(unittest.TestCase):
         meta = json.loads((output/'metadata.json').read_text())
         self.assertEqual((meta['format_version'], meta['weight_layout_version']), (2, 3))
         self.assertEqual(meta['qat_scheme'], QAT_SCHEME)
+        self.assertFalse(Path(meta['checkpoint']['path']).is_absolute())
+        self.assertEqual(meta['checkpoint']['path'], 'qat.pth')
         self.assertEqual(meta['layer_order'], list(LAYER_NAMES))
         rng = np.random.default_rng(1)
         previous_scale = None

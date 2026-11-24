@@ -1,0 +1,6 @@
+# Eager QAT compatibility baseline. Keep torch and torchvision as a matched pair.
+torch==2.6.0
+torchvision==0.21.0
+numpy>=1.26,<3
+Pillow>=10,<13
+PyYAML>=6,<7
