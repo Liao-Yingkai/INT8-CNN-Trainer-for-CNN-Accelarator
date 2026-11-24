@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.bin -text
+*.npy -text
+*.pth -text
+*.pt -text
+*.png -text
+*.jpg -text

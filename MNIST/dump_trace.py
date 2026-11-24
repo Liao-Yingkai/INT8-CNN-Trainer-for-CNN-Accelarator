@@ -71,7 +71,7 @@ def write_trace_header(
 ) -> None:
     """Write one image's intermediate tensors into a directly includable C header."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    include_guard = f"CNN_FPGA_TRACE_DATA_{sequence:04d}_H"
+    include_guard = f"MNIST_TRACE_DATA_{sequence:04d}_H"
     lines = [
         f"#ifndef {include_guard}",
         f"#define {include_guard}",
