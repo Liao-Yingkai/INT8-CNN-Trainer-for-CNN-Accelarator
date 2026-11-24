@@ -6,7 +6,7 @@
 
 ```text
 .
-├── CNN_FPGA/              # MNIST 源码、配置与使用入口
+├── MNIST/              # MNIST 源码、配置与使用入口
 ├── YOLOV2_TINY/           # YOLOv2-tiny 源码、配置与使用入口
 ├── docs/                 # 网络、量化、导出 ABI 与数据交接规范
 ├── scripts/              # 统一测试和 checkpoint 检查工具
@@ -30,10 +30,10 @@ python -m pip install -r requirements.txt
 以下命令以仓库根目录为工作目录：
 
 ```text
-python CNN_FPGA/train.py --mode float
-python CNN_FPGA/train.py --mode qat
-python CNN_FPGA/evaluate.py
-python CNN_FPGA/export.py
+python MNIST/train.py --mode float
+python MNIST/train.py --mode qat
+python MNIST/evaluate.py
+python MNIST/export.py
 ```
 
 YOLO 在准备好 VOC 数据后执行：
@@ -52,7 +52,7 @@ python YOLOV2_TINY/dump_trace.py --num-samples 1 --seed 1
 
 | 入口 | 内容 |
 |---|---|
-| [MNIST](CNN_FPGA/README.md) | 28×28 灰度分类训练、QAT、header 导出与黄金验证 |
+| [MNIST](MNIST/README.md) | 28×28 灰度分类训练、QAT、header 导出与黄金验证 |
 | [YOLOv2-tiny](YOLOV2_TINY/README.md) | 416×416 RGB VOC 检测、QAT、27 个模型 BIN、43 个单图 trace BIN |
 | [MNIST 导出规范](docs/mnist.md) | NCHW/HWC、FC 离线重排、NPY/header 及整数公式 |
 | [YOLO 导出规范](docs/yolov2_tiny.md) | 单次 PostProcess、权重 Pack、BIN 位序、metadata 和 trace |
@@ -66,7 +66,7 @@ python YOLOV2_TINY/dump_trace.py --num-samples 1 --seed 1
 python scripts/run_tests.py
 python scripts/run_tests.py --model mnist
 python scripts/run_tests.py --model yolov2_tiny
-python scripts/inspect_checkpoint.py CNN_FPGA/checkpoints/float_model_best.pth
+python scripts/inspect_checkpoint.py MNIST/checkpoints/float_model_best.pth
 ```
 
 回归使用临时合成数据，不访问训练数据集、不自动训练、不覆盖用户 checkpoint。测试通过表示软件数值和文件契约通过对应检查，不等同于检测精度、HLS 仿真、综合或板测通过。

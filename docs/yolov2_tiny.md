@@ -2,7 +2,7 @@
 
 详细网络、量化和导出规范；快速开始见 [YOLO 说明](../YOLOV2_TINY/README.md)，仓库导航见 [根说明](../README.md)。文中命令除特别说明外在 `YOLOV2_TINY/` 目录执行。
 
-当前提供 FP32 训练、官方 eager-mode QAT 微调、VOC2007 mAP50 评估，以及供 HLS 使用的 INT8/INT32 NPY/BIN 参数导出。脚本职责、训练模式和 checkpoint 命名与 `CNN_FPGA/` 保持一致；本目录的导出格式独立于 MNIST。
+当前提供 FP32 训练、官方 eager-mode QAT 微调、VOC2007 mAP50 评估，以及供 HLS 使用的 INT8/INT32 NPY/BIN 参数导出。脚本职责、训练模式和 checkpoint 命名与 `MNIST/` 保持一致；本目录的导出格式独立于 MNIST。
 
 ## 网络规格
 

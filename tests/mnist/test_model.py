@@ -9,7 +9,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parents[2]/'CNN_FPGA'
+ROOT = Path(__file__).resolve().parents[2]/'MNIST'
 sys.path.insert(0, str(ROOT))
 from model import MnistCnn
 from quant import load_qat_model, prepare_qat_model, save_checkpoint

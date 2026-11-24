@@ -1,6 +1,6 @@
 # MNIST INT8 QAT FPGA 参数导出工程
 
-详细数值和导出规范；快速开始见 [MNIST 说明](../CNN_FPGA/README.md)，仓库导航见 [根说明](../README.md)。文中命令除特别说明外在 `CNN_FPGA/` 目录执行。
+详细数值和导出规范；快速开始见 [MNIST 说明](../MNIST/README.md)，仓库导航见 [根说明](../README.md)。文中命令除特别说明外在 `MNIST/` 目录执行。
 
 本项目使用 PyTorch 训练一个轻量级 MNIST CNN，并通过 eager mode QAT（Quantization-Aware Training）获得适合 HLS FPGA CNN Accelerator 的对称 INT8 量化参数。
 
@@ -99,7 +99,7 @@ output_int8 ≈ (acc_int32 × multiplier) >> shift
 ```text
 .
 ├── README.md
-└── CNN_FPGA/
+└── MNIST/
     ├── model.py              # CNN 网络和 Conv+ReLU 融合接口
     ├── dataset.py            # MNIST 下载、归一化和 DataLoader
     ├── train.py              # FP32 训练与 QAT 微调入口
@@ -130,7 +130,7 @@ output_int8 ≈ (acc_int32 × multiplier) >> shift
 
 ## 配置
 
-训练参数位于 `CNN_FPGA/config.yaml`：
+训练参数位于 `MNIST/config.yaml`：
 
 ```yaml
 data_dir: data
@@ -146,7 +146,7 @@ QAT 并非从头训练。它必须先加载 `checkpoints/float_model.pth`，再�
 
 ## 完整运行流程
 
-以下命令均在 `CNN_FPGA/` 目录运行，也可以从仓库根目录使用 `python CNN_FPGA/<脚本>.py`。默认配置和数据按源码位置定位；显式 CLI 相对路径按启动目录解释。
+以下命令均在 `MNIST/` 目录运行，也可以从仓库根目录使用 `python MNIST/<脚本>.py`。默认配置和数据按源码位置定位；显式 CLI 相对路径按启动目录解释。
 
 ### 1. FP32 训练
 
@@ -360,7 +360,7 @@ python golden_model.py
 python dump_trace.py
 ```
 
-脚本会从 MNIST 测试集中随机选择图片；如果本地没有测试集，会自动下载到 `CNN_FPGA/data/`。脚本使用与训练相同的 `ToTensor()` 和 Normalize，并调用 `golden_model.py` 中已有的定点推理逻辑，不重新实现卷积。
+脚本会从 MNIST 测试集中随机选择图片；如果本地没有测试集，会自动下载到 `MNIST/data/`。脚本使用与训练相同的 `ToTensor()` 和 Normalize，并调用 `golden_model.py` 中已有的定点推理逻辑，不重新实现卷积。
 
 通过 `--num-samples` 指定导出的图片数量，默认导出 1 张。样本从测试集不重复抽取，因此数量不能超过 MNIST 测试集大小（10000）：
 

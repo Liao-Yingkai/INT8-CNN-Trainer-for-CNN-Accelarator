@@ -6,7 +6,7 @@
 
 | 模型 | 数据位置 | QAT 初始化 |
 |---|---|---|
-| MNIST | `CNN_FPGA/data/` | 默认 `CNN_FPGA/checkpoints/float_model.pth`，可用训练参数覆盖 |
+| MNIST | `MNIST/data/` | 默认 `MNIST/checkpoints/float_model.pth`，可用训练参数覆盖 |
 | YOLO | `YOLOV2_TINY/data/VOCdevkit/` | 用 `--float-checkpoint` 选择；兼容默认名为 `official_voc_fp32.pth` |
 
 MNIST 加载器支持下载；YOLO 读取预先准备的 VOC2007 trainval/test 和 VOC2012 trainval。checkpoint 由 PyTorch 保存，MNIST 包含 `model_state_dict`、epoch、accuracy；YOLO 还包含模型构造 `config` 和 mAP，QAT 包含明确方案标记。原始 Darknet `.weights`、其他框架文件不能直接当成本工程 checkpoint。

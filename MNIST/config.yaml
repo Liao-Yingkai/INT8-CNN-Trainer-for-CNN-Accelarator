@@ -1,4 +1,4 @@
-# All paths are relative to CNN_FPGA/.
+# All paths are relative to MNIST/.
 data_dir: data
 batch_size: 128
 num_workers: 4

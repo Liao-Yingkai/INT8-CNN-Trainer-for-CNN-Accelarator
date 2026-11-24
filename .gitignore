@@ -23,9 +23,9 @@ env/
 htmlcov/
 
 # Downloaded MNIST data and training checkpoints
-CNN_FPGA/data/
-CNN_FPGA/checkpoints/*
-!CNN_FPGA/checkpoints/.gitkeep
+MNIST/data/
+MNIST/checkpoints/*
+!MNIST/checkpoints/.gitkeep
 *.pth
 *.pt
 *.ckpt
@@ -43,8 +43,8 @@ YOLOV2_TINY/checkpoints/*
 !YOLOV2_TINY/checkpoints/.gitkeep
 
 # Generated FPGA parameter exports (NPY/JSON/BIN/headers belong here)
-CNN_FPGA/generated/*
-!CNN_FPGA/generated/.gitkeep
+MNIST/generated/*
+!MNIST/generated/.gitkeep
 YOLOV2_TINY/generated/*
 !YOLOV2_TINY/generated/.gitkeep
 
