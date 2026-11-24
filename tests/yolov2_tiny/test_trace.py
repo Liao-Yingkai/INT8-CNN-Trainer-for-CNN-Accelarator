@@ -1,5 +1,6 @@
 """Trace math and portable entry-point regression without VOC or checkpoints."""
 from pathlib import Path
+import ast
 import os
 import sys
 import tempfile
@@ -39,6 +40,22 @@ class TraceTests(unittest.TestCase):
                 self.assertEqual(load_config()['model']['num_classes'], 20)
             finally:
                 os.chdir(previous)
+
+    def test_default_float_checkpoint(self):
+        """The default QAT initialization follows the FP32 training output, not a local pretrained file."""
+        tree = ast.parse((ROOT/'train.py').read_text(encoding='utf-8'))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == 'add_argument' and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == '--float-checkpoint'):
+                default = next(item.value for item in node.keywords if item.arg == 'default')
+                self.assertIsInstance(default, ast.BinOp)
+                self.assertEqual(default.left.id, 'ROOT')
+                self.assertIsInstance(default.op, ast.Div)
+                self.assertEqual(default.right.value, 'checkpoints/float_model.pth')
+                return
+        self.fail('--float-checkpoint argument missing')
 
     def test_im2row_coordinates(self):
         """Cover G=1/2/128, both kernels and W=13 spatial tails."""

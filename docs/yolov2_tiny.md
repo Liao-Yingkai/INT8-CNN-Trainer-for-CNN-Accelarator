@@ -66,7 +66,7 @@ python train.py --mode qat --float-checkpoint checkpoints/float_model_best.pth
 python evaluate.py --float-checkpoint checkpoints/float_model_best.pth --qat-checkpoint checkpoints/qat_model_best.pth
 ```
 
-训练和评估可用 `--device` 选择设备、`--config` 选择配置。QAT 用 `--float-checkpoint` 指定初始化文件；兼容默认值仍是 `checkpoints/official_voc_fp32.pth`，自行训练时可改选 `checkpoints/float_model_best.pth`。脚本不会自动下载或切换权重；训练会写入固定 checkpoint 名称，运行前请保留需要的旧结果。
+训练和评估可用 `--device` 选择设备、`--config` 选择配置。QAT 默认从 `checkpoints/float_model.pth` 初始化，也可用 `--float-checkpoint` 显式选择 `checkpoints/float_model_best.pth` 或其他兼容 FP32 checkpoint。脚本不会自动下载或切换权重；训练会写入固定 checkpoint 名称，运行前请保留需要的旧结果。
 
 `config.yaml` 的 `training` 使用 `float_epochs`、`float_learning_rate`、`qat_epochs`、`qat_learning_rate` 等字段，与 MNIST 的含义一致。默认 QAT 20 个 epoch、学习率 0.0001；从零开始计数的 epoch 15 起冻结 Observer。
 
@@ -79,7 +79,7 @@ YOLO 先在 eval 状态把预训练 BN 折叠进 Conv，再执行 `prepare_qat()
 默认 FP32 文件仍是自训练 `float_model.pth`。要比较所选 FP32 初始化与新 QAT 的最佳结果，明确指定同源文件（新 QAT 完成后再运行）：
 
 ```text
-python evaluate.py --float-checkpoint checkpoints/official_voc_fp32.pth \
+python evaluate.py --float-checkpoint checkpoints/float_model_best.pth \
   --qat-checkpoint checkpoints/qat_model_best.pth
 ```
 

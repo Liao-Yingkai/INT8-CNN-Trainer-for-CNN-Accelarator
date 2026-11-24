@@ -91,7 +91,7 @@ def main():
     parser.add_argument('--mode', choices=['float', 'qat'], required=True)
     parser.add_argument('--config', type=Path, default=ROOT/'config.yaml')
     parser.add_argument('--device', default='auto')
-    parser.add_argument('--float-checkpoint', type=Path, default=ROOT/'checkpoints/official_voc_fp32.pth')
+    parser.add_argument('--float-checkpoint', type=Path, default=ROOT/'checkpoints/float_model.pth')
     args = parser.parse_args()
     config = load_config(args.config)
     random.seed(config['training']['seed']); torch.manual_seed(config['training']['seed'])

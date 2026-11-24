@@ -20,7 +20,7 @@ python YOLOV2_TINY/export.py --checkpoint YOLOV2_TINY/checkpoints/qat_model_best
 python YOLOV2_TINY/dump_trace.py --num-samples 1 --seed 1
 ```
 
-训练和评估支持 `--config`、`--device auto`（默认）、`--device cpu` 或显式设备。QAT 的 `--float-checkpoint` 必须是包含 `model_state_dict` 和 `config` 的未融合 FP32 checkpoint，不能直接传原始 Darknet `.weights`。为保留原有行为，未指定时仍读取 `checkpoints/official_voc_fp32.pth`；该文件不随仓库分发，不会自动下载。
+训练和评估支持 `--config`、`--device auto`（默认）、`--device cpu` 或显式设备。QAT 的 `--float-checkpoint` 必须是包含 `model_state_dict` 和 `config` 的未融合 FP32 checkpoint，不能直接传原始 Darknet `.weights`。未指定时默认读取 `checkpoints/float_model.pth`，即 FP32 训练的末轮输出；若使用最佳模型或额外提供的预训练文件，请显式指定。
 
 评估应显式选用 QAT 实际初始化的 FP32 和对应最佳 QAT。日志中的 val mAP 与 test mAP 不可混用；外部预训练可能已使用 val，应核实数据来源，不能将其当作独立留出集。
 
