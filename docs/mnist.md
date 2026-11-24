@@ -108,7 +108,6 @@ output_int8 ≈ (acc_int32 × multiplier) >> shift
     ├── export.py             # INT8/INT32 参数和 C header 导出
     ├── golden_model.py       # 导出参数的整数黄金验证模型
     ├── dump_trace.py         # 测试图模块边界数据导出
-    ├── observe_weight.py     # 兼容入口：检查 FP32/QAT checkpoint 摘要
     ├── config.yaml           # 训练超参数
     ├── checkpoints/          # 训练 checkpoint（Git 忽略）
     ├── generated/            # 导出参数（Git 忽略）
@@ -423,14 +422,6 @@ if (conv1_output[y][x][c] != trace_conv1_requant_int8_nhwc[(y * 28 + x) * 8 + c]
 ```
 
 该 trace 文件不包含额外 JSON metadata、scale 或浮点数据；shape 通过 C 数组声明和 header 注释给出，量化参数继续使用 `generated/headers/` 中的导出参数。
-
-### 7. 查看 checkpoint 内容（可选）
-
-```text
-python observe_weight.py
-```
-
-该脚本打印 `float_model_best.pth` 与 `qat_model_best.pth` 的 `model_state_dict`，主要用于观察 QAT checkpoint 中新增的 FakeQuant/Observer 状态。
 
 ## 导出权重布局
 
